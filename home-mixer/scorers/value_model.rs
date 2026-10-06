@@ -26,6 +26,7 @@ pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
         quoted_vqv: params.get(QuotedVqvWeight),
         follow_author: params.get(FollowAuthorWeight),
         post_unexplored: params.get(PostUnexploredWeight),
+        post_unexplored_include_out_of_network: false,
         not_interested: params.get(NotInterestedWeight),
         block_author: params.get(BlockAuthorWeight),
         mute_author: params.get(MuteAuthorWeight),
@@ -33,6 +34,9 @@ pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
         not_dwelled: params.get(NotDwelledWeight),
         cont_dwell_time: params.get(ContDwellTimeWeight),
         cont_click_dwell_time: params.get(ContClickDwellTimeWeight),
+        video_continuation: 0.0,
+        user_video_continuation: 0.0,
+        profile_visit_secs: 0.0,
         min_video_duration_ms: params.get(MinVideoDurationMs),
         enable_quoted_vqv_duration_check: params.get(EnableQuotedVqvDurationCheck),
         bidirectional_follow_reply_weight_boost: params.get(BidirectionalFollowReplyWeightBoost),
@@ -46,9 +50,7 @@ pub(crate) fn weights_for(query: &ScoredPostsQuery) -> ValueModelWeights {
 }
 
 pub(crate) fn applied_weights(query: &ScoredPostsQuery) -> HashMap<String, f64> {
-    let mut weights = weights_for(query).applied_weights_map();
-    weights.insert("active_secs_5m_residual_norm".to_string(), 0.0);
-    weights
+    weights_for(query).applied_weights_map()
 }
 
 pub(crate) fn scoring_inputs(
@@ -72,6 +74,7 @@ pub(crate) fn scoring_inputs(
         cold_start_lift_to_rank: candidate.cold_start_lift_to_rank,
         weighted_score: None,
         author_exploration_bonus: 0.0,
+        user_video_continuation_secs: None,
     }
 }
 
@@ -110,5 +113,7 @@ fn shared_phoenix_scores(s: &PhoenixScores) -> xai_value_model::PhoenixScores {
         post_unexplored_score: s.post_unexplored_score,
         dwell_time: s.dwell_time,
         click_dwell_time: s.click_dwell_time,
+        home_video_continuation_secs: s.home_video_continuation_secs,
+        home_profile_visit_secs: s.home_profile_visit_secs,
     }
 }

@@ -287,6 +287,8 @@ impl CandidateHelpers for PostCandidate {
             reward_rerank_slot_prob: None,
             page_decode_slot_prob: None,
             reranker_head_tag: self.reranker_head_tag,
+            prediction_heads: Vec::new(),
+            prediction_values: Vec::new(),
         }
     }
 

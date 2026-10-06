@@ -33,6 +33,7 @@ fn service_triple(
             ..
         }) => Some(reason.legacy()),
         Verdict::Shown {
+            notice: _,
             media: Some(Decided { value, .. }),
             engagement: None | Some(_),
         } => Some(value.legacy()),
@@ -41,6 +42,7 @@ fn service_triple(
             ..
         })
         | Verdict::Shown {
+            notice: _,
             media: None,
             engagement: None | Some(_),
         } => None,
@@ -509,6 +511,7 @@ mod tests {
 
     fn service_allow() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         }
@@ -527,6 +530,7 @@ mod tests {
 
     fn service_interstitial() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: Some(Decided {
                 value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                     legacy: FilteredReason::ContainNsfwMedia,

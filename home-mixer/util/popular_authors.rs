@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +8,7 @@ use tonic::async_trait;
 pub const REFRESH_INTERVAL_MS: i64 = 60 * 60 * 1000;
 pub const EMPTY_REFRESH_INTERVAL_MS: i64 = 60 * 1000;
 const STORE_FORMAT_VERSION: u8 = 1;
+pub const TOP_POSTING_AUTHORS_FRACTION: f64 = 0.00005;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PopularAuthor {
@@ -21,44 +22,24 @@ pub struct StoredPopularAuthors {
     pub authors: Vec<PopularAuthor>,
 }
 
-pub fn sort_by_followers(authors: impl IntoIterator<Item = PopularAuthor>) -> Vec<PopularAuthor> {
-    let mut by_author: HashMap<u64, u64> = HashMap::new();
-    for a in authors {
-        let entry = by_author.entry(a.author_id).or_insert(0);
-        *entry = (*entry).max(a.follower_count);
+pub fn select_top_posting_authors(
+    by_followers_desc: &[PopularAuthor],
+    active_posters_7d: u64,
+    fraction: f64,
+) -> Result<Vec<PopularAuthor>, String> {
+    let k = (active_posters_7d as f64 * fraction).ceil() as usize;
+    if k == 0 {
+        return Err(format!(
+            "no authors selected: {active_posters_7d} active posters x {fraction}"
+        ));
     }
-    let mut out: Vec<PopularAuthor> = by_author
-        .into_iter()
-        .map(|(author_id, follower_count)| PopularAuthor {
-            author_id,
-            follower_count,
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b.follower_count
-            .cmp(&a.follower_count)
-            .then(a.author_id.cmp(&b.author_id))
-    });
-    out
-}
-
-pub fn parse_author_rows(text: &str) -> Result<Vec<PopularAuthor>, String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && line.starts_with(|c: char| c.is_ascii_digit()))
-        .map(|line| {
-            let (id, followers) = line
-                .split_once(',')
-                .ok_or_else(|| format!("bad popular author row: {line}"))?;
-            Ok(PopularAuthor {
-                author_id: id.trim().parse().map_err(|e| format!("{line}: {e}"))?,
-                follower_count: followers
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("{line}: {e}"))?,
-            })
-        })
-        .collect()
+    if by_followers_desc.len() < k {
+        return Err(format!(
+            "need the top {k} posters by followers but the snapshot has {}",
+            by_followers_desc.len()
+        ));
+    }
+    Ok(by_followers_desc[..k].to_vec())
 }
 
 pub fn encode_stored(stored: &StoredPopularAuthors) -> Vec<u8> {
@@ -128,7 +109,7 @@ impl PopularAuthorsStore for InMemoryPopularAuthorsStore {
 
 #[derive(Default)]
 struct Snapshot {
-    authors: Vec<PopularAuthor>,
+    author_ids: HashSet<u64>,
     loaded_at_ms: Option<i64>,
 }
 
@@ -147,28 +128,17 @@ impl PopularAuthorsCache {
         }
     }
 
-    pub fn top_author_ids(&self, k: usize) -> Vec<u64> {
-        let snapshot = self.snapshot.read().unwrap();
-        snapshot
-            .authors
-            .iter()
-            .take(k)
-            .map(|a| a.author_id)
-            .collect()
-    }
-
-    pub fn contains_top(&self, author_id: u64, k: usize) -> bool {
-        let snapshot = self.snapshot.read().unwrap();
-        snapshot
-            .authors
-            .iter()
-            .take(k)
-            .any(|a| a.author_id == author_id)
+    pub fn contains(&self, author_id: u64) -> bool {
+        self.snapshot
+            .read()
+            .unwrap()
+            .author_ids
+            .contains(&author_id)
     }
 
     fn refresh_due(&self, now_ms: i64) -> bool {
         let snapshot = self.snapshot.read().unwrap();
-        let interval = if snapshot.authors.is_empty() {
+        let interval = if snapshot.author_ids.is_empty() {
             EMPTY_REFRESH_INTERVAL_MS
         } else {
             REFRESH_INTERVAL_MS
@@ -177,22 +147,21 @@ impl PopularAuthorsCache {
     }
 
     async fn refresh(&self, now_ms: i64) -> Result<usize, String> {
-        let authors = sort_by_followers(
-            self.store
-                .load()
-                .await?
-                .map(|s| s.authors)
-                .unwrap_or_default(),
-        );
-        let loaded = authors.len();
+        let authors = self
+            .store
+            .load()
+            .await?
+            .map(|s| s.authors)
+            .unwrap_or_default();
+        let author_ids: HashSet<u64> = authors.iter().map(|a| a.author_id).collect();
+        let loaded = author_ids.len();
         tracing::info!(
             loaded,
-            max_followers = authors.first().map_or(0, |a| a.follower_count),
-            min_followers = authors.last().map_or(0, |a| a.follower_count),
+            min_followers = authors.iter().map(|a| a.follower_count).min().unwrap_or(0),
             "popular authors loaded"
         );
         *self.snapshot.write().unwrap() = Snapshot {
-            authors,
+            author_ids,
             loaded_at_ms: Some(now_ms),
         };
         Ok(loaded)

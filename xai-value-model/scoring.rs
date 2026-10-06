@@ -58,6 +58,10 @@ fn apply(score: Option<f64>, weight: f64) -> f64 {
     score.unwrap_or(0.0) * weight
 }
 
+fn product(probability: Option<f64>, conditional_value: Option<f64>) -> Option<f64> {
+    Some(probability? * conditional_value?)
+}
+
 pub fn fuse_heads(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
     offset_score(compute_weighted_score(weights, candidate), weights)
 }
@@ -78,11 +82,12 @@ pub fn compute_weighted_score(
     } else {
         0.0
     };
-    let post_unexplored_weight = if candidate.in_network == Some(true) {
-        weights.post_unexplored
-    } else {
-        0.0
-    };
+    let post_unexplored_weight =
+        if weights.post_unexplored_include_out_of_network || candidate.in_network == Some(true) {
+            weights.post_unexplored
+        } else {
+            0.0
+        };
 
     [
         apply(scores.favorite_score, weights.favorite),
@@ -106,6 +111,21 @@ pub fn compute_weighted_score(
         apply(scores.quoted_vqv_score, quoted_vqv_weight),
         apply(scores.dwell_time, weights.cont_dwell_time),
         apply(scores.click_dwell_time, weights.cont_click_dwell_time),
+        apply(
+            product(scores.video_open_score, scores.home_video_continuation_secs),
+            weights.video_continuation,
+        ),
+        apply(
+            product(
+                scores.video_open_score,
+                candidate.user_video_continuation_secs,
+            ),
+            weights.user_video_continuation,
+        ),
+        apply(
+            product(scores.profile_click_score, scores.home_profile_visit_secs),
+            weights.profile_visit_secs,
+        ),
         apply(scores.follow_author_score, weights.follow_author),
         apply(scores.not_interested_score, weights.not_interested),
         apply(scores.block_author_score, weights.block_author),
@@ -116,6 +136,25 @@ pub fn compute_weighted_score(
     ]
     .iter()
     .sum()
+}
+
+pub fn set_user_video_continuation(candidates: &mut [CandidateScoringInputs]) {
+    let (open_weighted_secs, opens) = candidates
+        .iter()
+        .filter_map(|c| {
+            let scores = &c.phoenix_scores;
+            Some((
+                scores.video_open_score?,
+                scores.home_video_continuation_secs?,
+            ))
+        })
+        .fold((0.0, 0.0), |(secs, opens), (open, continuation)| {
+            (secs + open * continuation, opens + open)
+        });
+    let user_secs = (opens > 0.0).then(|| open_weighted_secs / opens);
+    for c in candidates {
+        c.user_video_continuation_secs = user_secs;
+    }
 }
 
 pub fn offset_score(combined_score: f64, w: &ValueModelWeights) -> f64 {

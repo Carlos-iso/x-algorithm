@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use xai_core_entities::entities::{EditControl, TakedownReason};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -15,16 +16,37 @@ pub struct NsfwFeature {
     pub admin: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArticleLifecycle {
+    Published,
+    SoftDeleted,
+    Draft,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TweetFeatures {
     pub media: MediaFeature,
     pub takedown_reasons: Vec<TakedownReason>,
     pub nsfw: NsfwFeature,
     pub is_nullcast: bool,
-    pub is_community_tweet: bool,
-    pub is_trusted_friends_tweet: bool,
+    pub community_id: Option<NonZeroU64>,
+    pub trusted_friends_list_id: Option<u64>,
     pub edit_control: Option<EditControl>,
     pub exclusive_conversation_author_id: Option<u64>,
+    pub article_id: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommunityModeration {
+    pub is_hidden: bool,
+    pub is_author_removed: bool,
+}
+
+impl CommunityModeration {
+    pub fn is_moderated(self) -> bool {
+        self.is_hidden || self.is_author_removed
+    }
 }
 
 impl TweetFeatures {
@@ -37,15 +59,17 @@ impl TweetFeatures {
     }
 
     pub fn is_superseded_edit(&self, tweet_id: u64) -> bool {
-        let edit_tweet_ids = match &self.edit_control {
-            Some(EditControl::Initial(initial)) => &initial.edit_tweet_ids,
-            Some(EditControl::Edit(edit)) => match &edit.edit_control_initial {
-                Some(initial) => &initial.edit_tweet_ids,
-                None => return false,
-            },
-            None => return false,
+        self.latest_edit_tweet_id()
+            .is_some_and(|latest| latest != tweet_id)
+    }
+
+    pub fn latest_edit_tweet_id(&self) -> Option<u64> {
+        let initial = match &self.edit_control {
+            Some(EditControl::Initial(initial)) => initial,
+            Some(EditControl::Edit(edit)) => edit.edit_control_initial.as_ref()?,
+            None => return None,
         };
-        edit_tweet_ids.last().is_some_and(|&last| last != tweet_id)
+        initial.edit_tweet_ids.last().copied()
     }
 
     pub fn legal_takedown_in(&self, request_country: Option<&str>) -> bool {

@@ -121,7 +121,11 @@ mod tests {
     use xai_visibility_filtering::evaluated::EvaluationResult;
     use xai_visibility_filtering::vf_client::XaiVfClient;
     use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
-    use xai_x_thrift::tweet_service::{TweetFieldsResultFound, TweetFieldsResultState};
+    use xai_x_thrift::action::{self, Action};
+    use xai_x_thrift::safety_result::{FilteredReason, SafetyResult};
+    use xai_x_thrift::tweet_service::{
+        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
+    };
 
     struct NoLabels;
 
@@ -154,9 +158,10 @@ mod tests {
                 LimitedActionsCopy::from_json("[]"),
             ),
             FilterTweetsEndpoint::new(filter_tweets, None),
-            GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(Arc::new(
-                RemoteSource::new(Arc::clone(&labels), labels),
-            )))),
+            GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
+                Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),
+                Some(1024),
+            ))),
         )
     }
 
@@ -184,7 +189,10 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_tweets_loopback() {
-        let (channel, handle) = serve(server(InMemorySources::default().tweet(1, 100))).await;
+        let (channel, handle) = serve(server(
+            InMemorySources::default().tweet(1, 100).authors(&[100]),
+        ))
+        .await;
         let client = XaiVfClient::from_channel(channel);
         let tweet = |tweet_id, outer_tweet_id: Option<u64>| vf_pb::TweetData {
             tweet_id,
@@ -213,14 +221,21 @@ mod tests {
                     TweetFieldsResultFound::new(None)
                 ))),
                 EvaluationResult::NotEvaluated,
-                EvaluationResult::Failed,
+                EvaluationResult::Evaluated(Box::new(TweetFieldsResultState::Filtered(
+                    TweetFieldsResultFiltered::new(FilteredReason::SafetyResult(
+                        SafetyResult::new(None, Action::Drop(action::Drop::new(None, None)),)
+                    ))
+                ))),
             ]
         );
     }
 
     #[tokio::test]
     async fn filter_tweets_loopback() {
-        let (channel, handle) = serve(server(InMemorySources::default())).await;
+        let (channel, handle) = serve(server(
+            InMemorySources::default().tweet(2, 20).authors(&[20]),
+        ))
+        .await;
         let mut client = VisibilityFilteringServiceClient::new(channel)
             .send_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Gzip);

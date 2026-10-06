@@ -41,13 +41,14 @@ COMPUTED_BOOL_FEATURE_NAMES: frozenset[str] = frozenset({"isStalePost14d"})
 
 AUTHOR_NSFW_BIT = 2
 
-WEB_CONV_TRACKING_INTEGRATION_CARDINALITY = 8
-
 
 class BoolFeature(enum.IntEnum):
     isStalePost14d = 0
     isAuthorFollowedByViewerSeq = 1
     isAuthorFollowingViewerSeq = 2
+
+
+WEB_CONV_TRACKING_INTEGRATION_CARDINALITY = 8
 
 
 class FloatFeature(enum.IntEnum):

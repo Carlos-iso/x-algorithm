@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-02T16:00:41Z
+// mirrored from config feature-switch defaults; last sync 2026-10-05T16:00:50Z
 use xai_feature_switches::param;
 
 param!(
@@ -122,7 +122,7 @@ param!(
     RetrievalCandidatesKafkaMaxCandidates,
     u32,
     "rust_home_mixer_retrieval_candidates_kafka_max_candidates",
-    200
+    100000
 );
 param!(
     EnableResponseDiversityStatsExperimentBucket,
@@ -275,6 +275,12 @@ param!(
     false
 );
 param!(RerankerHeadTag, i64, "rust_home_mixer_reranker_head_tag", 0);
+param!(
+    EnableHomeExcursionScores,
+    bool,
+    "rust_home_mixer_enable_home_excursion_scores",
+    false
+);
 
 // These weights reflect a combination of how much an action is
 // valued in ranking and typical propensities of these actions
@@ -448,7 +454,7 @@ param!(
     VMRankerClusterId,
     String,
     "rust_home_mixer_vm_ranker_cluster_id",
-    "Experiment6"
+    "Experiment1"
 );
 param!(
     PhoenixExperimentOverrides,
@@ -554,6 +560,12 @@ param!(
     bool,
     "rust_home_mixer_enable_cached_posts",
     true
+);
+param!(
+    EnableUnderTheHood,
+    bool,
+    "rust_home_mixer_enable_under_the_hood",
+    false
 );
 param!(
     MaxPostsToCache,
@@ -935,28 +947,10 @@ param!(
     false
 );
 param!(
-    PopularPostsTopAuthors,
-    u32,
-    "rust_home_mixer_popular_posts_top_authors",
-    1000
-);
-param!(
     PopularPostsMaxResults,
     u32,
     "rust_home_mixer_popular_posts_max_results",
     500
-);
-param!(
-    PopularPostsMaxPerAuthor,
-    u32,
-    "rust_home_mixer_popular_posts_max_per_author",
-    3
-);
-param!(
-    PopularPostsMaxRepliesRepostsPerAuthor,
-    u32,
-    "rust_home_mixer_popular_posts_max_replies_reposts_per_author",
-    0
 );
 
 param!(

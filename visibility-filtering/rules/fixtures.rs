@@ -3,13 +3,13 @@ use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
     DropReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
     MediaInterstitial, MediaRestriction, NsfwViewerDropReason, SafetyLabelMap, SafetyLabelType,
-    TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer, ViewerFeatures,
-    ViewerProfile, Withholding,
+    SoftIntervention, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer,
+    ViewerFeatures, ViewerProfile, Withholding,
 };
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::action::{InterstitialAction, InterstitialReason};
+use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
 const TWEET_ID: u64 = 1;
 pub(super) const AUTHOR_ID: u64 = 100;
@@ -115,6 +115,23 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
 
 pub(crate) fn allow() -> Verdict {
     Verdict::Shown {
+        notice: None,
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: SoftIntervention {
+                policy: AppealablePolicy::ABUSE,
+                level: 1,
+                proactive,
+                appeal_submitted,
+            },
+            by,
+        }),
         media: None,
         engagement: None,
     }
@@ -159,6 +176,7 @@ fn media_blurred(
     by: &'static str,
 ) -> Verdict {
     Verdict::Shown {
+        notice: None,
         media: Some(Decided {
             value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                 legacy: FilteredReason::ContainNsfwMedia,
@@ -173,6 +191,7 @@ fn media_blurred(
 
 pub(crate) fn legacy_interstitial(by: &'static str) -> Verdict {
     Verdict::Shown {
+        notice: None,
         media: Some(Decided {
             value: MediaRestriction::NsfwInterstitial,
             by,
@@ -192,6 +211,7 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
         value.add(reason);
     }
     Verdict::Shown {
+        notice: None,
         media: None,
         engagement: Some(Decided { value, by }),
     }
@@ -199,9 +219,11 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
 
 pub(crate) fn blurred_and_limited(blur: Verdict, limit: Verdict) -> Verdict {
     match (blur, limit) {
-        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => {
-            Verdict::Shown { media, engagement }
-        }
+        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => Verdict::Shown {
+            notice: None,
+            media,
+            engagement,
+        },
         (blur, limit) => panic!("expected two Shown verdicts, got {blur:?} and {limit:?}"),
     }
 }
@@ -270,12 +292,14 @@ pub(crate) fn candidate() -> CandidateBuilder {
             ..Default::default()
         },
         labels: HashSet::new(),
+        agent_labels: HashSet::new(),
     }
 }
 
 pub(crate) struct CandidateBuilder {
     candidate: HydratedTweetCandidate,
     labels: HashSet<SafetyLabelType>,
+    agent_labels: HashSet<SafetyLabelType>,
 }
 
 impl CandidateBuilder {
@@ -287,6 +311,11 @@ impl CandidateBuilder {
     pub(crate) fn with_label(mut self, label: SafetyLabelType) -> Self {
         self.labels.insert(label);
         self
+    }
+
+    pub(crate) fn with_agent_label(mut self, label: SafetyLabelType) -> Self {
+        self.agent_labels.insert(label);
+        self.with_label(label)
     }
 
     pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
@@ -331,7 +360,10 @@ impl CandidateBuilder {
     pub(crate) fn build(self) -> HydratedTweetCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
-            candidate.safety_labels = SafetyLabelMap::new(self.labels);
+            candidate.safety_labels = self.agent_labels.into_iter().fold(
+                SafetyLabelMap::new(self.labels),
+                SafetyLabelMap::assigned_by_agent,
+            );
         }
         candidate
     }

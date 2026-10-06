@@ -25,4 +25,6 @@ pub struct PhoenixScores {
     pub post_unexplored_score: Option<f64>,
     pub dwell_time: Option<f64>,
     pub click_dwell_time: Option<f64>,
+    pub home_video_continuation_secs: Option<f64>,
+    pub home_profile_visit_secs: Option<f64>,
 }

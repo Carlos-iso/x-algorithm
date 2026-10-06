@@ -131,7 +131,7 @@ impl Comparator for Arc<ReferenceCompareHarness> {
                     .iter()
                     .map(|outcome| TweetVerdict {
                         tweet_id: outcome.tweet_id.0,
-                        verdict: outcome.verdict.clone(),
+                        verdict: outcome.evaluation.verdict().clone(),
                     })
                     .collect(),
             );

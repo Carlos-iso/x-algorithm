@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
-use crate::hydration::Hydrators;
-use crate::models::Verdict;
+use crate::hydration::{Cause, Hydrators, Lookup};
+use crate::models::{Evaluation, Verdict};
 use crate::rules::SafetyLevel;
 use crate::treatment;
 
@@ -15,7 +15,8 @@ pub(crate) const BATCH_SIZE: &str = "filter_tweets_batch_size";
 const VERDICTS: &str = "filter_tweets_verdicts";
 const VERDICTS_BY_RULE: &str = "filter_tweets_verdicts_by_rule";
 const EVALUATED_CANDIDATES: &str = "filter_tweets_evaluated_candidates";
-const RESTED_ON_NONE: &str = "none";
+const FAIL_OPEN_DEFAULTS_NONE: &str = "none";
+const UNRESOLVED_TWEETS: &str = "vf_unresolved_tweets";
 const LOGGED_OUT_VIEWER: &str = "filter_tweets_logged_out_viewer";
 const VIEWER_ID_NORMALIZED: &str = "filter_tweets_viewer_id_normalized";
 const PHASE_MS: &str = "filter_tweets_phase_ms";
@@ -88,14 +89,44 @@ pub(crate) fn record_verdicts<'a>(
     }
 }
 
-pub(crate) fn record_rested_on(
+pub(crate) fn record_unresolved<'a>(
     rpc: Rpc,
     safety_level: SafetyLevel,
-    rested_on: impl IntoIterator<Item = Hydrators>,
+    evaluations: impl IntoIterator<Item = &'a Evaluation>,
+) {
+    let mut counts: HashMap<(Lookup, Cause), u64> = HashMap::new();
+    for evaluation in evaluations {
+        let unresolved = match *evaluation {
+            Evaluation::NotFound(lookup) => (lookup, Cause::NotFound),
+            Evaluation::Failed(lookup) => (lookup, Cause::Failed),
+            Evaluation::Complete { .. } | Evaluation::Partial { .. } => continue,
+        };
+        *counts.entry(unresolved).or_default() += 1;
+    }
+    let level = <&str>::from(safety_level);
+    let rpc = rpc.into();
+    for ((lookup, cause), count) in counts {
+        incr(
+            UNRESOLVED_TWEETS,
+            &[
+                ("lookup", lookup.into()),
+                ("cause", cause.into()),
+                ("rpc", rpc),
+                ("safety_level", level),
+            ],
+            count,
+        );
+    }
+}
+
+pub(crate) fn record_fail_open_defaults(
+    rpc: Rpc,
+    safety_level: SafetyLevel,
+    fail_open_defaults: impl IntoIterator<Item = Hydrators>,
 ) {
     let mut on_none = 0;
     let mut on_failed: HashMap<Hydrators, u64> = HashMap::new();
-    for nodes in rested_on {
+    for nodes in fail_open_defaults {
         if nodes.is_empty() {
             on_none += 1;
         } else {
@@ -107,7 +138,7 @@ pub(crate) fn record_rested_on(
     incr_nonzero(
         EVALUATED_CANDIDATES,
         &[
-            ("rested_on", RESTED_ON_NONE),
+            ("fail_open_defaults", FAIL_OPEN_DEFAULTS_NONE),
             ("safety_level", level),
             ("rpc", rpc),
         ],
@@ -118,7 +149,7 @@ pub(crate) fn record_rested_on(
         incr(
             EVALUATED_CANDIDATES,
             &[
-                ("rested_on", &nodes.join("+")),
+                ("fail_open_defaults", &nodes.join("+")),
                 ("safety_level", level),
                 ("rpc", rpc),
             ],
@@ -252,6 +283,7 @@ mod tests {
 
     fn allow() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         }
@@ -272,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_the_evaluated_candidates_metric_and_its_none_label() {
+    fn dashboard_generator_pins_the_evaluated_candidates_and_unresolved_tweets_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if Path::new(cargo).exists() { cargo } else { ws };
@@ -281,7 +313,10 @@ mod tests {
             "FT_EVALUATED_CANDIDATES_METRIC = \"{EVALUATED_CANDIDATES}\""
         )));
         assert!(dashboard.contains(&format!(
-            "FT_RESTED_ON_UNKNOWN_FILTER = 'rested_on!=\"{RESTED_ON_NONE}\"'"
+            "FT_FAIL_OPEN_DEFAULTS_FILTER = 'fail_open_defaults!~\"{FAIL_OPEN_DEFAULTS_NONE}|\"'"
+        )));
+        assert!(dashboard.contains(&format!(
+            "UNRESOLVED_TWEETS_METRIC = \"{UNRESOLVED_TWEETS}\""
         )));
     }
 
@@ -291,6 +326,7 @@ mod tests {
         let b = allow();
         let d = drop_by("nsfw_media");
         let both = Verdict::Shown {
+            notice: None,
             media: Some(Decided {
                 value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                     legacy: FilteredReason::ContainNsfwMedia,
@@ -302,6 +338,7 @@ mod tests {
             engagement: Some(limit_by("conversation_control")),
         };
         let limit_only = Verdict::Shown {
+            notice: None,
             media: None,
             engagement: Some(limit_by("conversation_control")),
         };

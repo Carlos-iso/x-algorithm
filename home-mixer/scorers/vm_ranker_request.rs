@@ -113,6 +113,7 @@ fn phoenix_scores_proto(s: &PhoenixScores) -> pb::PhoenixScores {
         open_link_score: s.open_link_score,
         quoted_vqv_score: s.quoted_vqv_score,
         post_unexplored_score: s.post_unexplored_score,
-        active_secs_5m_residual_norm: s.active_secs_5m_residual_norm,
+        home_video_continuation_secs: s.home_video_continuation_secs,
+        home_profile_visit_secs: s.home_profile_visit_secs,
     }
 }

@@ -182,13 +182,33 @@ class PostEmbeddingTable:
 _T = TypeVar("_T", bound=np.generic)
 
 
+def _list_values(col: pa.Array) -> pa.Array:
+    if pa.types.is_fixed_size_list(col.type):
+        list_size = col.type.list_size
+        return col.values.slice(col.offset * list_size, len(col) * list_size)
+    return col.values
+
+
+def _nested_list_values(col: pa.Array) -> pa.Array:
+    while (
+        pa.types.is_fixed_size_list(col.type)
+        or pa.types.is_list(col.type)
+        or pa.types.is_large_list(col.type)
+    ):
+        if pa.types.is_fixed_size_list(col.type):
+            col = _list_values(col)
+        else:
+            col = col.flatten()
+    return col
+
+
 def _col(
     rb: pa.RecordBatch,
     col: str,
     batch_size: int,
     t: type[_T],
 ) -> npt.NDArray[_T]:
-    values = rb.column(col).values
+    values = _list_values(rb.column(col))
     if values.null_count:
         values = values.fill_null(False if pa.types.is_boolean(values.type) else 0)
     arr = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(t)
@@ -201,7 +221,7 @@ def _col_null_filled(
     batch_size: int,
     t: type[_T],
 ) -> npt.NDArray[_T]:
-    values = rb.column(col).values
+    values = _list_values(rb.column(col))
     if values.null_count:
         values = values.fill_null(0)
     arr = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(t)
@@ -211,7 +231,7 @@ def _col_null_filled(
 def _bool_col_as_categorical(
     rb: pa.RecordBatch, col: str, batch_size: int
 ) -> npt.NDArray[np.int16]:
-    values = rb.column(col).values
+    values = _list_values(rb.column(col))
     valid = values.is_valid().to_numpy(zero_copy_only=False)
     filled = values.fill_null(False).to_numpy(zero_copy_only=False).astype(np.int16)
     arr = np.where(valid, filled + 1, 0).astype(np.int16).reshape(batch_size, -1)
@@ -478,13 +498,13 @@ def from_record_batch(
     assert action_col.type.value_type.list_size == output_vocab_size, (
         f"output_vocab_size ({output_vocab_size}) != record_batch action vocab size ({action_col.type.value_type.list_size})"
     )
-    flat_action = action_col.values.flatten().to_numpy(zero_copy_only=False)
+    flat_action = _nested_list_values(action_col).to_numpy(zero_copy_only=False)
     actions = flat_action.reshape(batch_size, -1, output_vocab_size).astype(np.bool_)
     actions = typing.cast(npt.NDArray[np.bool_], actions)
 
     if "continuousActionValuesSeqSeq" in record_batch.schema.names:
         continuous_values_col = record_batch.column("continuousActionValuesSeqSeq")
-        flat_values = continuous_values_col.values.flatten().to_numpy(zero_copy_only=False)
+        flat_values = _nested_list_values(continuous_values_col).to_numpy(zero_copy_only=False)
         assert continuous_values_col.type.value_type.list_size == num_continuous_actions, (
             f"num_continuous_actions ({num_continuous_actions}) != record_batch continuous action size ({continuous_values_col.type.value_type.list_size})"
         )
@@ -566,8 +586,7 @@ def from_record_batch(
             )
         try:
             emb_col = record_batch.column(col_name)
-            inner_list = emb_col.values
-            flat_values = inner_list.values
+            flat_values = _nested_list_values(emb_col)
             embedding_raw = (
                 flat_values.to_numpy(zero_copy_only=False)
                 .reshape(batch_size, max_candidates_for_embeddings, embedding_dim)
@@ -579,7 +598,7 @@ def from_record_batch(
     search_query_embeddings: np.ndarray | None = None
     if search_query_embedding_dim > 0 and "searchQueryEmbeddingSeq" in record_batch.schema.names:
         search_query_col = record_batch.column("searchQueryEmbeddingSeq")
-        flat_search_query = search_query_col.values.flatten().to_numpy(zero_copy_only=False)
+        flat_search_query = _nested_list_values(search_query_col).to_numpy(zero_copy_only=False)
         max_candidates_in_data = search_query_col.type.list_size
         actual_embedding_dim = search_query_col.type.value_type.list_size
         assert actual_embedding_dim == search_query_embedding_dim, (
@@ -592,7 +611,7 @@ def from_record_batch(
     semantic_ids_full_raw: np.ndarray | None = None
     if "semanticIdSeq" in record_batch.schema.names:
         sid_col = record_batch.column("semanticIdSeq")
-        flat_sid = sid_col.values.flatten().to_numpy(zero_copy_only=False)
+        flat_sid = _nested_list_values(sid_col).to_numpy(zero_copy_only=False)
         sid_seq_len = sid_col.type.list_size
         upstream_sid_dim = sid_col.type.value_type.list_size
         assert sid_seq_len == tweet_ids.shape[1], (
@@ -651,7 +670,10 @@ def from_record_batch(
 
     apps_col = record_batch.column("installedAppsMultiHot")
     user_installed_apps_multihot = (
-        apps_col.values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(np.bool_)
+        _list_values(apps_col)
+        .to_numpy(zero_copy_only=False)
+        .reshape(batch_size, -1)
+        .astype(np.bool_)
     )
 
     hist_shape_2d = (batch_size, max_history_post_action_pairs)

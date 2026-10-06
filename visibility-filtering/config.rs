@@ -1,7 +1,7 @@
-pub const ENV_FALLBACK_CACHE_ENABLED: &str = "VF_FALLBACK_CACHE_ENABLED";
+pub const ENV_AUTHOR_CACHE_CAPACITY: &str = "VF_AUTHOR_CACHE_CAPACITY";
+pub const ENV_TWEET_CACHE_CAPACITY: &str = "VF_TWEET_CACHE_CAPACITY";
+pub const ENV_SAFETY_LABEL_CACHE_CAPACITY: &str = "VF_SAFETY_LABEL_CACHE_CAPACITY";
 pub const ENV_CACHE_WARM_ENABLED: &str = "VF_CACHE_WARM_ENABLED";
-pub const ENV_AUTHOR_ID_FALLBACK_ENABLED: &str = "VF_AUTHOR_ID_FALLBACK_ENABLED";
-pub const ENV_AUTHOR_ID_FALLBACK_CAPACITY: &str = "VF_AUTHOR_ID_FALLBACK_CAPACITY";
 pub const ENV_REFERENCE: &str = "VF_REFERENCE";
 pub const ENV_DARK_TRAFFIC_ENABLED: &str = "DARK_TRAFFIC_ENABLED";
 pub const ENV_APP_ENV: &str = "APP_ENV";
@@ -48,22 +48,41 @@ pub(crate) fn refuse_reference() {
     }
 }
 
-pub(crate) fn fallback_cache_enabled() -> bool {
-    parse_env_flag(std::env::var(ENV_FALLBACK_CACHE_ENABLED).ok().as_deref())
+const DEFAULT_CACHE_CAPACITY: usize = 1_000_000;
+
+pub(crate) fn author_cache_capacity() -> Option<usize> {
+    cache_capacity(ENV_AUTHOR_CACHE_CAPACITY)
 }
 
-pub(crate) fn author_id_fallback_enabled() -> bool {
-    std::env::var(ENV_AUTHOR_ID_FALLBACK_ENABLED)
-        .ok()
-        .is_none_or(|value| parse_env_flag(Some(&value)))
+pub(crate) fn tweet_cache_capacity() -> Option<usize> {
+    cache_capacity(ENV_TWEET_CACHE_CAPACITY)
 }
 
-pub(crate) fn author_id_fallback_capacity() -> usize {
-    std::env::var(ENV_AUTHOR_ID_FALLBACK_CAPACITY)
-        .ok()
+pub(crate) fn safety_label_cache_capacity() -> Option<usize> {
+    cache_capacity(ENV_SAFETY_LABEL_CACHE_CAPACITY)
+}
+
+fn cache_capacity(name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok();
+    let capacity = parse_capacity(value.as_deref());
+    if let Some(value) = value
+        && value.trim().parse::<usize>().is_err()
+    {
+        tracing::warn!(
+            name,
+            value,
+            ?capacity,
+            "unparsable cache capacity; keeping the default"
+        );
+    }
+    capacity
+}
+
+fn parse_capacity(value: Option<&str>) -> Option<usize> {
+    let capacity = value
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|capacity| *capacity > 0)
-        .unwrap_or(1_000_000)
+        .unwrap_or(DEFAULT_CACHE_CAPACITY);
+    (capacity > 0).then_some(capacity)
 }
 
 pub(crate) fn cache_warm_enabled() -> bool {
@@ -81,7 +100,26 @@ pub(crate) fn parse_env_flag(value: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env_flag, resolve_gizmoduck_client_id, resolve_twemcache_client_name};
+    use super::{
+        DEFAULT_CACHE_CAPACITY, parse_capacity, parse_env_flag, resolve_gizmoduck_client_id,
+        resolve_twemcache_client_name,
+    };
+
+    #[test]
+    fn zero_turns_a_cache_off_and_an_unparsable_capacity_keeps_the_default() {
+        for (value, expected) in [
+            (None, Some(DEFAULT_CACHE_CAPACITY)),
+            (Some(""), Some(DEFAULT_CACHE_CAPACITY)),
+            (Some("-5"), Some(DEFAULT_CACHE_CAPACITY)),
+            (Some("-1"), Some(DEFAULT_CACHE_CAPACITY)),
+            (Some("2M"), Some(DEFAULT_CACHE_CAPACITY)),
+            (Some("0"), None),
+            (Some(" 0 "), None),
+            (Some(" 2000000 "), Some(2_000_000)),
+        ] {
+            assert_eq!(parse_capacity(value), expected, "{value:?}");
+        }
+    }
 
     #[test]
     fn client_ids_default_to_historical_values_and_overrides_win() {

@@ -17,6 +17,41 @@ pub(crate) enum Source {
     Flock,
     ViewerCountry,
     Wingman,
+    CommunityModeration,
+    CommunityModerator,
+    ArticleLifecycle,
+    TrustedFriends,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MissPolicy {
+        Unresolves(Subject),
+        FailsNode,
+        ReadsNoEdge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Subject {
+    Tweet,
+    Author,
+}
+
+impl Source {
+    pub(super) const fn miss_policy(self) -> MissPolicy {
+        match self {
+            Source::TesPureCore | Source::TesTweet => MissPolicy::Unresolves(Subject::Tweet),
+            Source::GizmoduckAuthor => MissPolicy::Unresolves(Subject::Author),
+            Source::TesConversationControl
+            | Source::SafetyLabels
+            | Source::GizmoduckViewer
+            | Source::Flock
+            | Source::ViewerCountry
+            | Source::CommunityModeration
+            | Source::CommunityModerator
+            | Source::ArticleLifecycle => MissPolicy::FailsNode,
+            Source::Wingman | Source::TrustedFriends => MissPolicy::ReadsNoEdge,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +72,7 @@ pub(super) enum Edge {
     SuperFollows,
     FollowedBy,
     SecondDegree,
+    TrustedFriends,
 }
 
 impl Edge {
@@ -50,7 +86,7 @@ impl Edge {
             Edge::BlockedBy => Some((Graph::Blocks, Reverse)),
             Edge::SuperFollows => Some((Graph::SuperFollows, Forward)),
             Edge::FollowedBy => Some((Graph::Follows, Reverse)),
-            Edge::SecondDegree => None,
+            Edge::SecondDegree | Edge::TrustedFriends => None,
         }
     }
 }
@@ -63,9 +99,13 @@ pub(super) enum KeyOrigin {
     PureCoreRetweeter,
     PureCoreReplyRoot,
     ExclusiveConversationAuthor,
+    TweetArticle,
     ConversationRoot(&'static [ConversationControlArm]),
     ViewerForCoAllowedList,
     MyNetworkRootNotFollowingViewer,
+    CommunityPost,
+    ModeratedCommunity,
+    TrustedFriendsList,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,11 +123,15 @@ impl KeyOrigin {
             KeyOrigin::PureCoreAuthor
             | KeyOrigin::PureCoreRetweeter
             | KeyOrigin::PureCoreReplyRoot => Some(Hydrator::PureCore),
-            KeyOrigin::ExclusiveConversationAuthor => Some(Hydrator::Tweet),
+            KeyOrigin::ExclusiveConversationAuthor
+            | KeyOrigin::CommunityPost
+            | KeyOrigin::TweetArticle
+            | KeyOrigin::TrustedFriendsList => Some(Hydrator::Tweet),
             KeyOrigin::ConversationRoot(_) | KeyOrigin::ViewerForCoAllowedList => {
                 Some(Hydrator::ConversationControl)
             }
             KeyOrigin::MyNetworkRootNotFollowingViewer => Some(Hydrator::RootFollowsViewer),
+            KeyOrigin::ModeratedCommunity => Some(Hydrator::CommunityModeration),
         }
     }
 
@@ -98,14 +142,18 @@ impl KeyOrigin {
         };
         match self {
             KeyOrigin::MyNetworkRootNotFollowingViewer => input.with(Hydrator::ConversationControl),
+            KeyOrigin::CommunityPost => input.with(Hydrator::PureCore),
             KeyOrigin::RequestTweets
             | KeyOrigin::Viewer
             | KeyOrigin::PureCoreAuthor
             | KeyOrigin::PureCoreRetweeter
             | KeyOrigin::PureCoreReplyRoot
             | KeyOrigin::ExclusiveConversationAuthor
+            | KeyOrigin::TweetArticle
             | KeyOrigin::ConversationRoot(_)
-            | KeyOrigin::ViewerForCoAllowedList => input,
+            | KeyOrigin::ViewerForCoAllowedList
+            | KeyOrigin::ModeratedCommunity
+            | KeyOrigin::TrustedFriendsList => input,
         }
     }
 }
@@ -252,6 +300,30 @@ impl Hydrator {
                 K::ViewerForCoAllowedList,
                 ("conversation_control", "tfe_top_country"),
             ),
+            H::CommunityModeration => node(
+                S::CommunityModeration,
+                Part::Column,
+                K::CommunityPost,
+                ("communities", "moderation_state"),
+            ),
+            H::CommunityModerator => node(
+                S::CommunityModerator,
+                Part::Column,
+                K::ModeratedCommunity,
+                ("communities", "visibility_features"),
+            ),
+            H::ArticleLifecycle => node(
+                S::ArticleLifecycle,
+                Part::Column,
+                K::TweetArticle,
+                ("article", "get_lifecycles"),
+            ),
+            H::TrustedFriends => node(
+                S::TrustedFriends,
+                Part::Edge(Edge::TrustedFriends),
+                K::TrustedFriendsList,
+                ("trusted_friends", "is_member_or_owner"),
+            ),
         }
     }
 
@@ -274,7 +346,9 @@ impl Hydrator {
         self.is_edge()
             || matches!(
                 self.spec().key,
-                KeyOrigin::Viewer | KeyOrigin::ViewerForCoAllowedList
+                KeyOrigin::Viewer
+                    | KeyOrigin::ViewerForCoAllowedList
+                    | KeyOrigin::ModeratedCommunity
             )
     }
 }
@@ -292,12 +366,19 @@ const fn inputs_precede_nodes() -> bool {
     true
 }
 
-const fn author_keys_come_from_pure_core() -> bool {
+const fn miss_policies_fit_their_nodes() -> bool {
     let mut rest = Hydrator::VARIANTS;
     while let [node, tail @ ..] = rest {
-        if matches!(node.spec().source, Source::GizmoduckAuthor)
-            && !matches!(node.input(), Some(Hydrator::PureCore))
-        {
+        let spec = node.spec();
+        let fits = match spec.source.miss_policy() {
+            MissPolicy::Unresolves(Subject::Tweet) => matches!(spec.key, KeyOrigin::RequestTweets),
+            MissPolicy::Unresolves(Subject::Author) => {
+                matches!(spec.key, KeyOrigin::PureCoreAuthor)
+            }
+            MissPolicy::FailsNode => true,
+            MissPolicy::ReadsNoEdge => node.is_edge(),
+        };
+        if !fits {
             return false;
         }
         rest = tail;
@@ -306,7 +387,7 @@ const fn author_keys_come_from_pure_core() -> bool {
 }
 
 const _: () = assert!(inputs_precede_nodes());
-const _: () = assert!(author_keys_come_from_pure_core());
+const _: () = assert!(miss_policies_fit_their_nodes());
 const _: () = assert!(Hydrator::VARIANTS.len() <= u32::BITS as usize);
 
 impl Hydrators {
@@ -471,7 +552,11 @@ fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
         | Source::GizmoduckViewer
         | Source::Flock
         | Source::ViewerCountry
-        | Source::Wingman => nodes,
+        | Source::Wingman
+        | Source::CommunityModeration
+        | Source::CommunityModerator
+        | Source::ArticleLifecycle
+        | Source::TrustedFriends => nodes,
     };
     let mut fields = Vec::new();
     for node in nodes.iter() {
@@ -512,6 +597,7 @@ impl fmt::Display for KeyOrigin {
             KeyOrigin::PureCoreRetweeter => f.write_str("retweeter"),
             KeyOrigin::PureCoreReplyRoot => f.write_str("reply_root"),
             KeyOrigin::ExclusiveConversationAuthor => f.write_str("exclusive_author"),
+            KeyOrigin::TweetArticle => f.write_str("article"),
             KeyOrigin::ConversationRoot(arms) => {
                 let arms: Vec<String> = arms.iter().map(|arm| format!("{arm:?}")).collect();
                 write!(f, "root:{}", arms.join("|"))
@@ -520,6 +606,9 @@ impl fmt::Display for KeyOrigin {
             KeyOrigin::MyNetworkRootNotFollowingViewer => {
                 f.write_str("root:MyNetwork:not_followed")
             }
+            KeyOrigin::CommunityPost => f.write_str("community_post"),
+            KeyOrigin::ModeratedCommunity => f.write_str("moderated_community"),
+            KeyOrigin::TrustedFriendsList => f.write_str("trusted_friends_list"),
         }
     }
 }
@@ -579,7 +668,7 @@ mod tests {
     const PLANS: &str = "\
 filter_all: 1 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
-timeline_home: 7 calls
+timeline_home: 8 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 safety_labels/get after: - nodes: tweet_safety_labels
@@ -587,7 +676,8 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDE
 gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-timeline_home_recommendations: 7 calls
+trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
+timeline_home_recommendations: 8 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 safety_labels/get after: - nodes: tweet_safety_labels
@@ -595,7 +685,8 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDE
 gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-timeline_home_hydration: 11 calls
+trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
+timeline_home_hydration: 15 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 conversation_control/get_conversation_controls after: - nodes: conversation_control
@@ -607,7 +698,11 @@ exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_ex
 conversation_control/batch_check_followed_by+batch_check_super_follows after: conversation_control nodes: root_follows_viewer,super_follows_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] (skipped logged out)
 conversation_control/exists_intersect after: root_follows_viewer nodes: root_follows_viewer_second_degree (skipped logged out)
 conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out)
-immersive_expanded_recommendations: 7 calls
+communities/moderation_state after: tweet nodes: community_moderation
+communities/visibility_features after: community_moderation nodes: community_moderator (skipped logged out)
+article/get_lifecycles after: tweet nodes: article_lifecycle
+trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
+immersive_expanded_recommendations: 8 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 safety_labels/get after: - nodes: tweet_safety_labels
@@ -615,6 +710,7 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDE
 gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
+trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
 ";
 
     #[test]

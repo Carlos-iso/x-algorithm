@@ -1,29 +1,15 @@
 use crate::hydration::{HydrationPlan, Hydrators};
 use crate::models::{
-    Decided, HydratedTweetCandidate, LimitedEngagement, Verdict, ViewerFeatures, Withholding,
+    Decided, Evaluation, HydratedTweetCandidate, LimitedEngagement, SafetyLabelType,
+    SoftIntervention, Verdict, ViewerFeatures, Withholding,
 };
 use crate::params::CountryLists;
 use crate::rules::rule_spec::{ActionSpec, RuleClause, RuleId, Truth};
-use crate::rules::RuleContext;
 use crate::rules::{author_rules, tweet_rules};
+use crate::rules::{RuleContext, SafetyLevel};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use strum::VariantArray;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
-#[strum(serialize_all = "snake_case")]
-pub enum SafetyLevel {
-    FilterAll,
-    TimelineHome,
-    TimelineHomeRecommendations,
-    TimelineHomeHydration,
-    ImmersiveExpandedRecommendations,
-}
-
-pub struct Evaluation {
-    pub verdict: Verdict,
-    pub rested_on: Hydrators,
-}
 
 pub(super) struct Policy {
     clauses: Vec<(&'static str, RuleClause)>,
@@ -53,10 +39,26 @@ impl Policy {
     }
 
     pub(super) fn evaluate(&self, context: &RuleContext<'_>) -> Evaluation {
+        let (verdict, fail_open_defaults) = self.decide(context);
+        if context.failed().is_empty() {
+            debug_assert!(
+                fail_open_defaults.is_empty(),
+                "a verdict over no failed node relies on no default"
+            );
+            Evaluation::Complete { verdict }
+        } else {
+            Evaluation::Partial {
+                verdict,
+                fail_open_defaults,
+            }
+        }
+    }
+
+    fn decide(&self, context: &RuleContext<'_>) -> (Verdict, Hydrators) {
         let mut media = None;
         let mut engagement = None;
-        let mut withholding_rested_on = Hydrators::empty();
-        let mut slot_rested_on = Hydrators::empty();
+        let mut withholding_defaults = Hydrators::empty();
+        let mut slot_defaults = Hydrators::empty();
 
         for &(by, ref rule) in &self.clauses {
             let truth = rule.applies(context);
@@ -66,31 +68,31 @@ impl Policy {
             };
             match &rule.action {
                 ActionSpec::Drop(reason) => {
-                    withholding_rested_on = withholding_rested_on.union(unknown_reads);
+                    withholding_defaults = withholding_defaults.union(unknown_reads);
                     if truth.resolves_true() {
-                        return Evaluation {
-                            verdict: Verdict::Withheld(Decided {
+                        return (
+                            Verdict::Withheld(Decided {
                                 value: Withholding::Drop(reason.clone()),
                                 by,
                             }),
-                            rested_on: withholding_rested_on,
-                        };
+                            withholding_defaults,
+                        );
                     }
                 }
                 ActionSpec::Tombstone(reason) => {
-                    withholding_rested_on = withholding_rested_on.union(unknown_reads);
+                    withholding_defaults = withholding_defaults.union(unknown_reads);
                     if truth.resolves_true() {
-                        return Evaluation {
-                            verdict: Verdict::Withheld(Decided {
+                        return (
+                            Verdict::Withheld(Decided {
                                 value: Withholding::Tombstone(*reason),
                                 by,
                             }),
-                            rested_on: withholding_rested_on,
-                        };
+                            withholding_defaults,
+                        );
                     }
                 }
                 ActionSpec::MediaRestriction(value) if media.is_none() => {
-                    slot_rested_on = slot_rested_on.union(unknown_reads);
+                    slot_defaults = slot_defaults.union(unknown_reads);
                     if truth.resolves_true() {
                         media = Some(Decided {
                             value: value.clone(),
@@ -100,7 +102,7 @@ impl Policy {
                 }
                 ActionSpec::LimitedEngagement(reason) => {
                     if engagement.is_none() {
-                        slot_rested_on = slot_rested_on.union(unknown_reads);
+                        slot_defaults = slot_defaults.union(unknown_reads);
                     }
                     if truth.resolves_true() {
                         match &mut engagement {
@@ -115,13 +117,45 @@ impl Policy {
                     }
                 }
                 ActionSpec::MediaRestriction(_) => {}
+                ActionSpec::SoftIntervention {
+                    label,
+                    policy,
+                    level,
+                } if media.is_none() => {
+                    slot_defaults = slot_defaults.union(unknown_reads);
+                    if truth.resolves_true() {
+                        let labels = context.tweet_safety_labels();
+                        return (
+                            Verdict::Shown {
+                                notice: Some(Decided {
+                                    value: SoftIntervention {
+                                        policy: *policy,
+                                        level: *level,
+                                        proactive: !labels.is_by_agent(*label),
+                                        appeal_submitted: labels
+                                            .has_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED),
+                                    },
+                                    by,
+                                }),
+                                media: None,
+                                engagement: None,
+                            },
+                            withholding_defaults.union(slot_defaults),
+                        );
+                    }
+                }
+                ActionSpec::SoftIntervention { .. } => {}
             }
         }
 
-        Evaluation {
-            verdict: Verdict::Shown { media, engagement },
-            rested_on: withholding_rested_on.union(slot_rested_on),
-        }
+        (
+            Verdict::Shown {
+                notice: None,
+                media,
+                engagement,
+            },
+            withholding_defaults.union(slot_defaults),
+        )
     }
 
     fn rule_names(&self) -> impl Iterator<Item = &'static str> + '_ {
@@ -138,7 +172,7 @@ impl Policy {
     }
 }
 
-fn timeline_home_shared() -> Vec<RuleClause> {
+pub(super) fn timeline_home_shared() -> Vec<RuleClause> {
     [
         author_rules::author_state_drops(),
         author_rules::socialgraph_drops(),
@@ -171,18 +205,26 @@ fn timeline_home_recommendation_only() -> Vec<RuleClause> {
     .concat()
 }
 
-fn timeline_home_hydration() -> Vec<RuleClause> {
+pub(super) fn timeline_home_recommendations() -> Vec<RuleClause> {
+    [timeline_home_shared(), timeline_home_recommendation_only()].concat()
+}
+
+pub(super) fn timeline_home_hydration() -> Vec<RuleClause> {
     [
         author_rules::home_hydration_author_state_drops(),
         tweet_rules::fosnr_level_3_drops(),
         tweet_rules::fosnr_level_1_non_follower_drop(),
+        tweet_rules::fosnr_level_1_follower_soft_intervention(),
         tweet_rules::fosnr_fallback_drop(),
         tweet_rules::creator_tweet_nsfw_drop(),
         tweet_rules::protected_community_tweet_drop(),
+        tweet_rules::hidden_community_tweet_drop(),
+        tweet_rules::author_removed_community_tweet_drop(),
         tweet_rules::home_hydration_tweet_label_drops(),
         tweet_rules::exclusive_tweet_drop(),
         tweet_rules::trusted_friends_tweet_drop(),
         tweet_rules::takedown_drops(),
+        tweet_rules::article_tweet_content_drop(),
         tweet_rules::author_blocks_viewer_exclusive_content_drop(),
         tweet_rules::sensitive_viewer_drops(),
         tweet_rules::home_hydration_nsfw_rules(),
@@ -191,7 +233,7 @@ fn timeline_home_hydration() -> Vec<RuleClause> {
     .concat()
 }
 
-fn immersive_expanded_recommendations() -> Vec<RuleClause> {
+pub(super) fn immersive_expanded_recommendations() -> Vec<RuleClause> {
     [
         author_rules::author_state_drops(),
         author_rules::socialgraph_drops(),
@@ -201,6 +243,7 @@ fn immersive_expanded_recommendations() -> Vec<RuleClause> {
         tweet_rules::takedown_drops(),
         tweet_rules::sensitive_viewer_drops(),
         tweet_rules::exclusive_tweet_drop(),
+        tweet_rules::trusted_friends_tweet_drop(),
         tweet_rules::recs_media_drops(),
         tweet_rules::gore_and_violence_high_precision::oon_drop(),
         tweet_rules::oon_low_quality_tweet_label_drops(),
@@ -256,7 +299,7 @@ impl RuleEngine {
         let levels = SafetyLevel::VARIANTS
             .iter()
             .map(|&level| {
-                let clauses = Self::clauses(level)
+                let clauses = (level.spec().rules)()
                     .into_iter()
                     .map(|clause| (interned_name(&mut names, &clause), clause))
                     .collect();
@@ -268,18 +311,6 @@ impl RuleEngine {
         Self {
             country_lists,
             levels,
-        }
-    }
-
-    fn clauses(level: SafetyLevel) -> Vec<RuleClause> {
-        match level {
-            SafetyLevel::FilterAll => tweet_rules::filter_all(),
-            SafetyLevel::TimelineHome => timeline_home_shared(),
-            SafetyLevel::TimelineHomeRecommendations => {
-                [timeline_home_shared(), timeline_home_recommendation_only()].concat()
-            }
-            SafetyLevel::TimelineHomeHydration => timeline_home_hydration(),
-            SafetyLevel::ImmersiveExpandedRecommendations => immersive_expanded_recommendations(),
         }
     }
 
@@ -360,7 +391,7 @@ mod tests {
 
         let verdict = rule_engine
             .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .verdict;
+            .into_verdict();
         assert!(!matches!(verdict, Verdict::Withheld(_)));
 
         country_lists.refresh(
@@ -378,7 +409,7 @@ country_specific_nsfw_content_gating:
         );
         let verdict = rule_engine
             .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .verdict;
+            .into_verdict();
         assert!(matches!(
             verdict,
             Verdict::Withheld(Decided {
@@ -388,6 +419,38 @@ country_specific_nsfw_content_gating:
                 by: "sensitive_viewer_no_stated_age/drop",
             })
         ));
+    }
+
+    #[test]
+    fn a_failed_article_lookup_is_a_partial_drop() {
+        use crate::models::TweetFeatures;
+        use crate::rules::fixtures::dropped;
+        use std::num::NonZeroU64;
+        use xai_visibility_filtering::models::FilteredReason;
+
+        let candidate = HydratedTweetCandidate {
+            failed: Hydrators::of(Hydrator::ArticleLifecycle),
+            ..candidate()
+                .with_tweet_features(TweetFeatures {
+                    article_id: NonZeroU64::new(1),
+                    ..TweetFeatures::default()
+                })
+                .build()
+        };
+        assert_eq!(
+            RuleEngine::for_tests().evaluate(
+                SafetyLevel::TimelineHomeHydration,
+                &viewer(VIEWER_ID),
+                &candidate,
+            ),
+            Evaluation::Partial {
+                verdict: dropped(
+                    FilteredReason::UnspecifiedReason,
+                    "article_tweet_content/drop/unspecified",
+                ),
+                fail_open_defaults: Hydrators::of(Hydrator::ArticleLifecycle),
+            }
+        );
     }
 
     #[test]
@@ -429,7 +492,7 @@ country_specific_nsfw_content_gating:
                 &viewer,
                 &candidate.with_media().build(),
             )
-            .verdict
+            .into_verdict()
         {
             Verdict::Withheld(Decided { by, .. }) => Some(by),
             Verdict::Shown { .. } => None,
@@ -557,6 +620,8 @@ country_specific_nsfw_content_gating:
                 "fosnr_fallback/drop/undesirable",
                 "creator_tweet_nsfw/drop/nsfw_media",
                 "protected_community_tweet/drop/unspecified",
+                "hidden_community_tweet/drop/unspecified",
+                "author_removed_community_tweet/drop/unspecified",
                 "spam/drop/undesirable",
                 "pdna/drop/safety_result",
                 "bounce/drop/bounced",
@@ -565,6 +630,7 @@ country_specific_nsfw_content_gating:
                 "trusted_friends_tweet/drop/unspecified",
                 "legal_takedown/drop/unspecified",
                 "local_laws_takedown/drop/unspecified",
+                "article_tweet_content/drop/unspecified",
                 "author_blocks_viewer_exclusive_content/drop/unspecified",
                 "sensitive_viewer_logged_out/drop",
                 "sensitive_viewer_underage/drop",
@@ -606,6 +672,7 @@ country_specific_nsfw_content_gating:
                 "nsfw_card_image/blur/sensitive",
                 "nsfw_card_image/legacy_interstitial",
                 "gore_and_violence_high_precision/blur/age_prompt",
+                "fosnr_abuse_insults_follower/soft_intervention/abuse",
                 "blocked_viewer/limited_engagement",
                 "blocked_viewer/limited_engagement/root_author_blocked_viewer",
                 "stale_tweet/limited_engagement",
@@ -648,6 +715,7 @@ country_specific_nsfw_content_gating:
                 "sensitive_viewer_underage/drop",
                 "sensitive_viewer_no_stated_age/drop",
                 "exclusive_tweet/drop",
+                "trusted_friends_tweet/drop/unspecified",
                 "dmca_media/drop/unspecified",
                 "geo_restricted_media/drop/unspecified",
                 "gore_and_violence_high_precision/drop/nsfw_media",
@@ -682,7 +750,7 @@ country_specific_nsfw_content_gating:
         let viewer = viewer(VIEWER_ID);
         let candidate = candidate().build();
         for &level in SafetyLevel::VARIANTS {
-            for clause in RuleEngine::clauses(level) {
+            for clause in (level.spec().rules)() {
                 for condition in &clause.when {
                     let leaves = match condition {
                         Condition::Holds(leaf) | Condition::Not(leaf) => slice::from_ref(leaf),
@@ -791,7 +859,7 @@ country_specific_nsfw_content_gating:
                 .hydrated_by(Hydrators::all().without(Hydrator::Follows));
 
             assert_eq!(
-                tombstone_first().evaluate(&context).verdict,
+                tombstone_first().evaluate(&context).into_verdict(),
                 withheld(
                     Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
                     "drop"
@@ -846,11 +914,12 @@ country_specific_nsfw_content_gating:
             let (viewer, candidate) = context_inputs();
 
             let Verdict::Shown {
+                notice: None,
                 media,
                 engagement: Some(limit),
             } = restrictions()
                 .evaluate(&test_context(&viewer, &candidate))
-                .verdict
+                .into_verdict()
             else {
                 panic!("expected a limited verdict");
             };
@@ -919,19 +988,21 @@ country_specific_nsfw_content_gating:
                     follows,
                 ),
             ];
-            for (index, (when, verdict, rested_on)) in rows.into_iter().enumerate() {
-                let evaluation = Policy::new(vec![("rule", clause(when, DROP_SUSPENDED))])
-                    .evaluate(&test_context(&viewer, &candidate));
+            for (index, (when, verdict, fail_open_defaults)) in rows.into_iter().enumerate() {
                 assert_eq!(
-                    (evaluation.verdict, evaluation.rested_on),
-                    (verdict, rested_on),
+                    Policy::new(vec![("rule", clause(when, DROP_SUSPENDED))])
+                        .evaluate(&test_context(&viewer, &candidate)),
+                    Evaluation::Partial {
+                        verdict,
+                        fail_open_defaults
+                    },
                     "row {index}"
                 );
             }
         }
 
         #[test]
-        fn a_verdict_rests_on_the_unknown_clauses_that_could_have_changed_it() {
+        fn fail_open_defaults_are_the_unknown_clauses_that_could_have_changed_the_verdict() {
             let (viewer, candidate) = follows_and_blocks_failed();
             let follows = Hydrators::of(Hydrator::Follows);
             let unknown = |action| ("unknown", clause(&[Condition::Holds(FOLLOWS)], action));
@@ -967,12 +1038,13 @@ country_specific_nsfw_content_gating:
                     follows,
                 ),
             ];
-            for (index, (rules, verdict, rested_on)) in rows.into_iter().enumerate() {
-                let evaluation =
-                    Policy::new(rules.into()).evaluate(&test_context(&viewer, &candidate));
+            for (index, (rules, verdict, fail_open_defaults)) in rows.into_iter().enumerate() {
                 assert_eq!(
-                    (evaluation.verdict, evaluation.rested_on),
-                    (verdict, rested_on),
+                    Policy::new(rules.into()).evaluate(&test_context(&viewer, &candidate)),
+                    Evaluation::Partial {
+                        verdict,
+                        fail_open_defaults
+                    },
                     "row {index}"
                 );
             }

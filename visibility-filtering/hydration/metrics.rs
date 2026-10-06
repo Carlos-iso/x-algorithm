@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::hash::Hash;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
-use xai_x_rpc::WithBudget;
 
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
 use crate::rules::SafetyLevel;
@@ -20,9 +18,11 @@ const HYDRATOR_EXPANDED_KEYS: &str = "vf_hydrator_expanded_keys";
 const HYDRATOR_UNASKED_KEYS: &str = "vf_hydrator_unasked_keys";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
+const FALLBACK_CACHE_RESIDENT_KEYS: &str = "vf_fallback_cache_resident_keys";
 const AUTHOR_LABELS: &str = "vf_author_labels";
 const VIEWER_COUNTRY: &str = "vf_viewer_country";
 const WINGMAN_SECOND_DEGREE: &str = "vf_wingman_second_degree";
+const TRUSTED_FRIENDS_ANSWERS: &str = "vf_trusted_friends_answers";
 const FLOCK_MISSING_KEYS: &str = "vf_flock_missing_keys";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
@@ -48,14 +48,14 @@ struct KeyedResultCounts {
 
 impl KeyedResultCounts {
     fn from_batch<K, V>(
-        candidate_count_by_key: &HashMap<K, usize>,
+        candidate_count_by_claimed_key: &HashMap<K, usize>,
         batches: &impl AsRef<[HydrationBatch<K, V>]>,
     ) -> Self
     where
         K: Eq + Hash,
     {
         let mut counts = Self::default();
-        for (key, candidate_count) in candidate_count_by_key {
+        for (key, &candidate_count) in candidate_count_by_claimed_key {
             let hydrated = batches
                 .as_ref()
                 .iter()
@@ -94,13 +94,17 @@ impl KeyedResultCounts {
     }
 }
 
-fn record_keyed_hydrator_request(
+pub(crate) fn record_keyed_hydrator_request<K, V>(
     client: &str,
     method: &str,
     safety_level: SafetyLevel,
-    counts: KeyedResultCounts,
+    candidate_count_by_claimed_key: &HashMap<K, usize>,
+    answer: &impl AsRef<[HydrationBatch<K, V>]>,
     latency_ms: f64,
-) {
+) where
+    K: Eq + Hash,
+{
+    let counts = KeyedResultCounts::from_batch(candidate_count_by_claimed_key, answer);
     let outcome = counts.outcome();
     if outcome != HydratorOutcome::Success {
         debug!(
@@ -212,6 +216,20 @@ pub(crate) fn record_wingman_second_degree(
     }
 }
 
+pub(crate) fn record_trusted_friends_answers(
+    member_or_owner: usize,
+    neither: usize,
+    safety_level: SafetyLevel,
+) {
+    for (result, count) in [("true", member_or_owner), ("false", neither)] {
+        incr_nonzero(
+            TRUSTED_FRIENDS_ANSWERS,
+            &[("result", result), ("safety_level", safety_level.into())],
+            count as u64,
+        );
+    }
+}
+
 pub(crate) fn record_flock_missing_keys(
     client: &str,
     method: &str,
@@ -253,7 +271,8 @@ pub(crate) fn record_unasked_keys(client: &str, method: &str, keys: usize) {
 }
 
 pub(crate) fn record_fallback_cache_keys(
-    facet: &'static str,
+    cache: &'static str,
+    column: &'static str,
     fresh: usize,
     stale: usize,
     not_found: usize,
@@ -269,39 +288,25 @@ pub(crate) fn record_fallback_cache_keys(
     ] {
         incr_nonzero(
             FALLBACK_CACHE_KEYS,
-            &[("facet", facet), ("result", result)],
+            &[("cache", cache), ("column", column), ("result", result)],
             count as u64,
         );
     }
 }
 
-pub(crate) async fn timed_results<K, V, A>(
-    client: &str,
-    method: &str,
-    safety_level: SafetyLevel,
-    candidate_count_by_key: &HashMap<K, usize>,
-    timeout: Duration,
-    fut: impl Future<Output = A>,
-    timed_out: impl FnOnce(HydrationBatch<K, V>) -> A,
-) -> A
-where
-    K: Copy + Eq + Hash,
-    A: AsRef<[HydrationBatch<K, V>]>,
-{
-    let start = Instant::now();
-    let answer = fut.with_budget(timeout).await.unwrap_or_else(|_| {
-        timed_out(HydrationBatch::timed_out(
-            candidate_count_by_key.keys().copied(),
-        ))
-    });
-    record_keyed_hydrator_request(
-        client,
-        method,
-        safety_level,
-        KeyedResultCounts::from_batch(candidate_count_by_key, &answer),
-        start.elapsed().as_secs_f64() * 1000.0,
-    );
-    answer
+pub(crate) fn record_fallback_cache_resident_keys(
+    cache: &'static str,
+    column: &'static str,
+    resident: usize,
+    absent: usize,
+) {
+    for (result, count) in [("resident", resident), ("absent", absent)] {
+        incr_nonzero(
+            FALLBACK_CACHE_RESIDENT_KEYS,
+            &[("cache", cache), ("column", column), ("result", result)],
+            count as u64,
+        );
+    }
 }
 
 fn incr(metric: &str, labels: &[(&str, &str)], count: u64) {
@@ -319,9 +324,9 @@ fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) -> bool {
     }
 }
 
-pub(crate) fn record_fallback_cache_entries(facet: &'static str, entries: usize) {
+pub(crate) fn record_fallback_cache_entries(cache: &'static str, entries: usize) {
     if let Some(sr) = global_stats_receiver() {
-        sr.gauge(FALLBACK_CACHE_ENTRIES, &[("facet", facet)], entries as f64);
+        sr.gauge(FALLBACK_CACHE_ENTRIES, &[("cache", cache)], entries as f64);
     }
 }
 
@@ -334,7 +339,12 @@ fn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: Histogram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::identity;
+    use crate::hydration::execute::Reply;
+    use crate::hydration::plan::Source;
+    use crate::hydration::store::Store;
+    use crate::models::{RawCandidate, TweetFeatures, TweetId};
+    use crate::rules::RuleEngine;
+    use xai_x_rpc::WithBudget;
 
     #[test]
     fn dashboard_generator_pins_the_author_labels_root_edges_method_wingman_metric_and_key_results()
@@ -358,6 +368,9 @@ mod tests {
         assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
         assert!(dashboard.contains(&format!(
             "WINGMAN_SECOND_DEGREE_METRIC = \"{WINGMAN_SECOND_DEGREE}\""
+        )));
+        assert!(dashboard.contains(&format!(
+            "TRUSTED_FRIENDS_ANSWERS_METRIC = \"{TRUSTED_FRIENDS_ANSWERS}\""
         )));
         let key_results: Vec<&str> = <HydratorOutcome as strum::VariantArray>::VARIANTS
             .iter()
@@ -463,27 +476,40 @@ mod tests {
         assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
     }
 
-    #[tokio::test]
-    async fn timed_results_outer_timeout_fails_every_expected_key() {
-        let expected = HashMap::from([(1, 2), (2, 3)]);
-        let never = std::future::pending::<HydrationBatch<u64, u8>>();
+    #[test]
+    fn a_tweet_keyed_call_counts_its_keys_before_pure_core_resolves_authors() {
+        let engine = RuleEngine::for_tests();
+        let plan = engine.plan(SafetyLevel::TimelineHomeHydration);
+        let raw = [RawCandidate {
+            tweet_id: TweetId(1),
+            request_author_id: None,
+        }];
+        let mut store = Store::new(plan, Some(50), &raw, false);
+        let group = |source| plan.groups().find(|group| group.source == source).unwrap();
+        let tweets = store.offer(group(Source::TesTweet)).unwrap();
+        let circle = TweetFeatures {
+            trusted_friends_list_id: Some(7),
+            ..Default::default()
+        };
+        let landed =
+            HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(circle)))]));
+        store.land(&tweets, Reply::Tweets(landed), Duration::ZERO);
 
-        let returned = timed_results(
-            "test",
-            "timeout",
-            SafetyLevel::TimelineHome,
-            &expected,
-            Duration::ZERO,
-            never,
-            identity,
-        )
-        .await;
+        let call = store.offer(group(Source::TrustedFriends)).unwrap();
+        let failed: HydrationBatch<u64, bool> =
+            HydrationBatch::from_results(call.keys.clone(), HashMap::<_, Result<_, ()>>::new());
+        let counts = KeyedResultCounts::from_batch(&call.candidate_count_by_claimed_key, &failed);
+        assert_eq!((counts.error_keys, counts.error_candidates), (1, 1));
+        assert_eq!(counts.outcome(), HydratorOutcome::Error);
+    }
 
-        for key in [1, 2] {
-            assert!(matches!(
-                returned.hydrated(&key),
-                Some(Hydrated::Failed(HydrationError::Timeout))
-            ));
-        }
+    #[test]
+    fn a_claimed_key_no_candidate_counted_still_counts_its_timeout() {
+        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40]);
+
+        let counts = KeyedResultCounts::from_batch(&HashMap::from([(40, 0)]), &batch);
+
+        assert_eq!((counts.timeout_keys, counts.timeout_candidates), (1, 0));
+        assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
     }
 }

@@ -1,8 +1,10 @@
 mod age_gating;
 mod age_verification;
+mod article;
 mod author_state;
 mod baseline;
 mod builders;
+mod community;
 mod conversation_control;
 mod exclusive_content;
 mod interstitial;
@@ -83,9 +85,14 @@ impl Row {
 fn deciders(verdict: &Verdict) -> Vec<&'static str> {
     match verdict {
         Verdict::Withheld(decided) => vec![decided.by],
-        Verdict::Shown { media, engagement } => media
+        Verdict::Shown {
+            notice,
+            media,
+            engagement,
+        } => notice
             .iter()
-            .map(|blur| blur.by)
+            .map(|notice| notice.by)
+            .chain(media.iter().map(|blur| blur.by))
             .chain(engagement.iter().map(|limit| limit.by))
             .collect(),
     }
@@ -101,7 +108,7 @@ fn golden_corpus_pins_policy_verdicts() {
     for case in cases {
         let verdict = rule_engine
             .evaluate(case.level, &case.viewer, &case.candidate)
-            .verdict;
+            .into_verdict();
         if matches!(&case.expected, Verdict::Shown { media: Some(_), .. }) {
             let (action, reason) = proto_action(verdict.clone());
             assert_eq!(action.encode_to_vec(), [0x20, 0x01], "{}", case.name);
@@ -170,7 +177,7 @@ fn every_node_failing_changes_no_corpus_verdict() {
         case.candidate.failed = Hydrators::all();
         let verdict = rule_engine
             .evaluate(case.level, &case.viewer, &case.candidate)
-            .verdict;
+            .into_verdict();
         assert_eq!(verdict, case.expected, "{}", case.name);
     }
 }
@@ -210,7 +217,9 @@ fn rows() -> Vec<Row> {
         author_state::rows(),
         tweet_label::rows(),
         tweet_state::rows(),
+        community::rows(),
         takedown::rows(),
+        article::rows(),
         age_gating::rows(),
         age_verification::rows(),
         exclusive_content::rows(),

@@ -151,11 +151,6 @@ fn build_scored_candidate(candidate: &PostCandidate, position: i32) -> pb::Score
         "click_dwell_time",
         s.click_dwell_time,
     );
-    insert_score(
-        &mut prediction_scores,
-        "active_secs_5m_residual_norm",
-        s.active_secs_5m_residual_norm,
-    );
 
     let source_tweet_id = candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id);
 
@@ -242,7 +237,6 @@ mod tests {
                 not_dwelled_score: Some(0.4),
                 post_unexplored_score: Some(0.5),
                 click_dwell_time: Some(1.5),
-                active_secs_5m_residual_norm: Some(0.6),
                 ..Default::default()
             },
             ..Default::default()
@@ -253,10 +247,6 @@ mod tests {
         assert_eq!(scored.prediction_scores["not_dwelled"], 0.4);
         assert_eq!(scored.prediction_scores["post_unexplored"], 0.5);
         assert_eq!(scored.prediction_scores["click_dwell_time"], 1.5);
-        assert_eq!(
-            scored.prediction_scores["active_secs_5m_residual_norm"],
-            0.6
-        );
     }
 
     #[test]

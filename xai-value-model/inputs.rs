@@ -13,6 +13,7 @@ pub struct CandidateScoringInputs {
     pub cold_start_lift_to_rank: Option<u32>,
     pub weighted_score: Option<f64>,
     pub author_exploration_bonus: f64,
+    pub user_video_continuation_secs: Option<f64>,
 }
 
 impl CandidateScoringInputs {

@@ -6,6 +6,7 @@ use crate::models::{
 };
 use crate::rules::fixtures::{allow, candidate, dropped, limited, viewer, VIEWER_ID};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use std::num::NonZeroU64;
 use xai_core_entities::entities::{EditControl, EditControlInitial};
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -45,7 +46,7 @@ pub(super) fn rows() -> Vec<Row> {
             name: "nullcast_community",
             post: tweet_candidate(|t| {
                 t.is_nullcast = true;
-                t.is_community_tweet = true;
+                t.community_id = NonZeroU64::new(500);
             }),
             expect: vec![(TimelineHome, Role::NonFollower, allow())],
         },
@@ -57,7 +58,7 @@ pub(super) fn rows() -> Vec<Row> {
                     ..Default::default()
                 })
                 .with_tweet_features(TweetFeatures {
-                    is_community_tweet: true,
+                    community_id: NonZeroU64::new(500),
                     ..Default::default()
                 })
                 .build(),

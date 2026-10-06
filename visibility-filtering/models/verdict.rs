@@ -1,13 +1,23 @@
+use crate::hydration::{Hydrators, Lookup};
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::action::{InterstitialAction, InterstitialReason};
+use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
     Withheld(Decided<Withholding>),
     Shown {
+        notice: Option<Decided<SoftIntervention>>,
         media: Option<Decided<MediaRestriction>>,
         engagement: Option<Decided<LimitedEngagement>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftIntervention {
+    pub policy: AppealablePolicy,
+    pub level: i8,
+    pub proactive: bool,
+    pub appeal_submitted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,10 +138,60 @@ impl LimitedEngagementReason {
 }
 
 impl Verdict {
-    pub fn unresolved_author() -> Self {
+    pub const fn not_found() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
-            by: "unresolved_author_id",
+            by: "not_found",
         })
+    }
+
+    pub const fn lookup_failed() -> Self {
+        Self::Withheld(Decided {
+            value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            by: "lookup_failed",
+        })
+    }
+}
+
+static NOT_FOUND: Verdict = Verdict::not_found();
+static LOOKUP_FAILED: Verdict = Verdict::lookup_failed();
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Evaluation {
+    Complete {
+        verdict: Verdict,
+    },
+    Partial {
+        verdict: Verdict,
+        fail_open_defaults: Hydrators,
+    },
+    NotFound(Lookup),
+    Failed(Lookup),
+}
+
+impl Evaluation {
+    pub fn verdict(&self) -> &Verdict {
+        match self {
+            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::NotFound(_) => &NOT_FOUND,
+            Self::Failed(_) => &LOOKUP_FAILED,
+        }
+    }
+
+    pub fn into_verdict(self) -> Verdict {
+        match self {
+            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::NotFound(_) => Verdict::not_found(),
+            Self::Failed(_) => Verdict::lookup_failed(),
+        }
+    }
+
+    pub fn fail_open_defaults(&self) -> Hydrators {
+        match self {
+            Self::Partial {
+                fail_open_defaults, ..
+            } => *fail_open_defaults,
+            Self::Complete { .. } | Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
+        }
     }
 }

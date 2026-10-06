@@ -1,6 +1,8 @@
 use crate::hydration::sources::Sources;
-use crate::hydration::{HydratedTweet, Hydration, HydrationRequest, Hydrators};
-use crate::models::{ClientCapability, HydratedTweetCandidate, RawCandidate, TweetId, Verdict};
+use crate::hydration::{
+    Cause, HydratedTweet, Hydration, HydrationRequest, Hydrators, Lookup, Unresolved,
+};
+use crate::models::{ClientCapability, Evaluation, HydratedTweetCandidate, RawCandidate, TweetId};
 use crate::rules::metrics::{self as ft_metrics, RetweetSources, Rpc};
 use crate::rules::{RuleEngine, SafetyLevel};
 use std::collections::HashMap;
@@ -17,20 +19,11 @@ pub struct FilterRequest {
     pub rpc: Rpc,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvaluationStatus {
-    Evaluated,
-    UnresolvedAuthor,
-    Failed,
-}
-
 #[derive(Clone)]
 pub struct FilterOutcome {
     pub tweet_id: TweetId,
     pub source_tweet_id: Option<TweetId>,
-    pub verdict: Verdict,
-    pub rested_on: Hydrators,
-    pub status: EvaluationStatus,
+    pub evaluation: Evaluation,
     pub safety_labels: Option<vf_pb::SafetyLabelMap>,
 }
 
@@ -106,7 +99,7 @@ impl FilterTweets {
         } else if request.candidates.iter().any(|candidate| {
             hydration
                 .tweet(candidate.tweet_id)
-                .is_some_and(|tweet| tweet.is_evaluable() && tweet.source_tweet_id().is_some())
+                .is_some_and(|tweet| tweet.source_to_merge().is_some())
         }) {
             RetweetSources::InBatch
         } else {
@@ -174,32 +167,41 @@ impl FilterTweets {
         copied_retweet: Option<&HydratedTweetCandidate>,
     ) -> FilterOutcome {
         let tweet = hydrated.hydration.tweet(tweet_id);
-        let (verdict, rested_on, status) = match copied_retweet.or_else(|| tweet?.candidate()) {
-            None => (
-                Verdict::unresolved_author(),
-                Hydrators::empty(),
-                EvaluationStatus::UnresolvedAuthor,
-            ),
-            Some(candidate) => {
+        let evaluation = match tweet {
+            Some(HydratedTweet::Resolved {
+                candidate,
+                has_failed_node,
+                ..
+            }) => {
                 let evaluation = self.rule_engine.evaluate(
                     hydrated.safety_level,
                     hydrated.hydration.viewer(),
-                    candidate,
+                    copied_retweet.unwrap_or(candidate),
                 );
-                let status = if tweet.is_some_and(HydratedTweet::has_failed_node) {
-                    EvaluationStatus::Failed
-                } else {
-                    EvaluationStatus::Evaluated
-                };
-                (evaluation.verdict, evaluation.rested_on, status)
+                match evaluation {
+                    Evaluation::Complete { verdict } if *has_failed_node => Evaluation::Partial {
+                        verdict,
+                        fail_open_defaults: Hydrators::empty(),
+                    },
+                    Evaluation::Complete { .. }
+                    | Evaluation::Partial { .. }
+                    | Evaluation::NotFound(_)
+                    | Evaluation::Failed(_) => evaluation,
+                }
             }
+            Some(HydratedTweet::Unresolved {
+                reason: Unresolved { lookup, cause },
+                ..
+            }) => match cause {
+                Cause::NotFound => Evaluation::NotFound(*lookup),
+                Cause::Failed => Evaluation::Failed(*lookup),
+            },
+            None => Evaluation::Failed(Lookup::Tweet),
         };
         FilterOutcome {
             tweet_id,
             source_tweet_id: tweet.and_then(HydratedTweet::source_tweet_id),
-            verdict,
-            rested_on,
-            status,
+            evaluation,
             safety_labels: tweet
                 .and_then(HydratedTweet::safety_labels)
                 .map(|labels| vf_pb::SafetyLabelMap::clone(labels)),
@@ -236,16 +238,28 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeQuery, Graph};
     use crate::hydration::plan::Source;
     use crate::hydration::sources::{Fault, InMemorySources};
-    use crate::hydration::Hydrator;
-    use crate::models::{LimitedEngagementReason, TweetFeatures};
+    use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator};
+    use crate::models::{LimitedEngagementReason, TweetFeatures, Verdict};
     use crate::rules::fixtures::{allow, dropped, limited};
-    use xai_core_entities::entities::PureCoreData;
+    use xai_core_entities::entities::{
+        GizmoduckUser, GizmoduckUserResult, PureCoreData, UserResponseState,
+    };
     use xai_visibility_filtering::models::FilteredReason;
 
     fn candidate(tweet_id: u64, author_id: Option<u64>) -> RawCandidate {
         RawCandidate {
             tweet_id: TweetId(tweet_id),
             request_author_id: author_id,
+        }
+    }
+
+    fn user(user_id: u64, response_state: UserResponseState) -> GizmoduckUserResult {
+        GizmoduckUserResult {
+            user: Some(GizmoduckUser {
+                user_id,
+                ..Default::default()
+            }),
+            response_state: Some(response_state),
         }
     }
 
@@ -258,7 +272,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pure_core_timeout_fails_every_candidate_at_hydration_timeout() {
-        let sources = Arc::new(InMemorySources::default().fault(Source::TesPureCore, Fault::Hangs));
+        let sources = Arc::new(
+            InMemorySources::default()
+                .tweet_features(1, TweetFeatures::default())
+                .tweet_features(2, TweetFeatures::default())
+                .authors(&[20])
+                .fault(Source::TesPureCore, Fault::Hangs),
+        );
         let started = tokio::time::Instant::now();
         let response = tokio::time::timeout(
             crate::hydration::HYDRATION_TIMEOUT * 2,
@@ -277,16 +297,10 @@ mod tests {
         assert_eq!(
             response
                 .outcomes
-                .iter()
-                .map(|outcome| (outcome.verdict.clone(), outcome.status))
+                .into_iter()
+                .map(|outcome| outcome.evaluation)
                 .collect::<Vec<_>>(),
-            vec![
-                (
-                    Verdict::unresolved_author(),
-                    EvaluationStatus::UnresolvedAuthor
-                ),
-                (allow(), EvaluationStatus::Failed),
-            ]
+            vec![Evaluation::Failed(Lookup::Tweet); 2]
         );
     }
 
@@ -304,6 +318,7 @@ mod tests {
                 .pure_core(1, reply(10, 100, 30))
                 .pure_core(2, reply(20, 101, 40))
                 .tweet(3, 10)
+                .authors(&[10, 20])
                 .edge(Graph::Blocks, 20, 50)
                 .edge(Graph::Blocks, 30, 50),
         );
@@ -321,32 +336,30 @@ mod tests {
                 .await
                 .outcomes
                 .into_iter()
-                .map(|outcome| (outcome.status, outcome.verdict))
+                .map(|outcome| outcome.evaluation)
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             verdicts(Some(50)).await,
             vec![
-                (
-                    EvaluationStatus::Evaluated,
-                    limited(
+                Evaluation::Complete {
+                    verdict: limited(
                         LimitedEngagementReason::RootAuthorBlockedViewer,
                         "blocked_viewer/limited_engagement/root_author_blocked_viewer",
                     ),
-                ),
-                (
-                    EvaluationStatus::Evaluated,
-                    limited(
+                },
+                Evaluation::Complete {
+                    verdict: limited(
                         LimitedEngagementReason::BlockedViewer,
                         "blocked_viewer/limited_engagement",
                     ),
-                ),
-                (EvaluationStatus::Evaluated, allow()),
+                },
+                Evaluation::Complete { verdict: allow() },
             ]
         );
         assert_eq!(
             verdicts(None).await,
-            vec![(EvaluationStatus::Evaluated, allow()); 3]
+            vec![Evaluation::Complete { verdict: allow() }; 3]
         );
         assert_eq!(
             sources.selects(),
@@ -354,6 +367,123 @@ mod tests {
                 EdgeQuery::forward(Graph::Follows, vec![10, 20]),
                 EdgeQuery::reverse(Graph::Blocks, vec![10, 20, 30]),
             ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_friends_posts_show_to_list_members_and_owners_and_a_failed_lookup_drops_them()
+    {
+        let trusted_friends = |list_id| TweetFeatures {
+            trusted_friends_list_id: Some(list_id),
+            ..Default::default()
+        };
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .tweet_features(1, trusted_friends(7))
+                .tweet(2, 11)
+                .tweet_features(2, trusted_friends(7))
+                .tweet(3, 12)
+                .tweet_features(3, trusted_friends(9))
+                .tweet(4, 13)
+                .authors(&[10, 11, 12, 13])
+                .trusted_friend(7, 50)
+        };
+        let judged = |sources: Arc<InMemorySources>, viewer_id, ids: &[u64]| {
+            let candidates = ids.iter().map(|&id| candidate(id, None)).collect();
+            async move {
+                service(&sources)
+                    .run(FilterRequest {
+                        viewer_id,
+                        country_code: None,
+                        client_capability: ClientCapability::default(),
+                        safety_level: SafetyLevel::TimelineHomeHydration,
+                        candidates,
+                        rpc: Rpc::FilterTweets,
+                    })
+                    .await
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.evaluation)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let shown = || Evaluation::Complete { verdict: allow() };
+        let trusted_friends_drop = || Evaluation::Complete {
+            verdict: dropped(
+                FilteredReason::UnspecifiedReason,
+                "trusted_friends_tweet/drop/unspecified",
+            ),
+        };
+
+        let healthy = Arc::new(world());
+        assert_eq!(
+            judged(Arc::clone(&healthy), Some(50), &[1, 2, 3, 4]).await,
+            [shown(), shown(), trusted_friends_drop(), shown()]
+        );
+        assert_eq!(healthy.keys(Source::TrustedFriends), [vec![7, 9]]);
+
+        let failed = world().fault(Source::TrustedFriends, Fault::Fails);
+        assert_eq!(
+            judged(Arc::new(failed), Some(50), &[1, 4]).await,
+            [trusted_friends_drop(), shown()]
+        );
+
+        for (viewer_id, ids) in [(None, &[1, 2][..]), (Some(50), &[4][..])] {
+            let sources = Arc::new(world());
+            judged(Arc::clone(&sources), viewer_id, ids).await;
+            assert!(!sources.calls().contains(&Source::TrustedFriends));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_circle_row_served_from_the_fallback_cache_still_asks_the_trusted_friends_list() {
+        let trusted_friends = |list_id| TweetFeatures {
+            trusted_friends_list_id: Some(list_id),
+            ..Default::default()
+        };
+        let sources = Arc::new(
+            InMemorySources::default()
+                .with_tweet_cache(tweet_fallback_cache(8))
+                .tweet(1, 10)
+                .tweet_features(1, trusted_friends(7))
+                .tweet(2, 11)
+                .tweet_features(2, trusted_friends(9))
+                .authors(&[10, 11])
+                .trusted_friend(7, 50),
+        );
+        let judged = || async {
+            service(&sources)
+                .run(FilterRequest {
+                    viewer_id: Some(50),
+                    country_code: None,
+                    client_capability: ClientCapability::default(),
+                    safety_level: SafetyLevel::TimelineHomeHydration,
+                    candidates: vec![candidate(1, None), candidate(2, None)],
+                    rpc: Rpc::FilterTweets,
+                })
+                .await
+                .outcomes
+                .into_iter()
+                .map(|outcome| outcome.evaluation)
+                .collect::<Vec<_>>()
+        };
+        let expected = [
+            Evaluation::Complete { verdict: allow() },
+            Evaluation::Complete {
+                verdict: dropped(
+                    FilteredReason::UnspecifiedReason,
+                    "trusted_friends_tweet/drop/unspecified",
+                ),
+            },
+        ];
+
+        assert_eq!(judged().await, expected);
+        sources.break_source(Source::TesTweet, Fault::Fails);
+        assert_eq!(judged().await, expected);
+        assert_eq!(
+            sources.keys(Source::TrustedFriends),
+            [vec![7, 9], vec![7, 9]]
         );
     }
 
@@ -369,8 +499,8 @@ mod tests {
             InMemorySources::default()
                 .pure_core(1, retweet)
                 .tweet(2, 10)
-                .edge(Graph::MuteRetweets, 50, 10)
-                .fail_key(Source::TesTweet, 1),
+                .authors(&[10])
+                .edge(Graph::MuteRetweets, 50, 10),
         );
         let outcomes = service(&sources)
             .run(FilterRequest {
@@ -386,73 +516,281 @@ mod tests {
         assert_eq!(
             outcomes
                 .into_iter()
-                .map(|outcome| (outcome.status, outcome.verdict, outcome.rested_on))
+                .map(|outcome| outcome.evaluation)
                 .collect::<Vec<_>>(),
             vec![
-                (
-                    EvaluationStatus::Failed,
-                    dropped(
+                Evaluation::Complete {
+                    verdict: dropped(
                         FilteredReason::UnspecifiedReason,
                         "viewer_mutes_retweets/drop/unspecified",
                     ),
-                    Hydrators::empty(),
-                ),
-                (EvaluationStatus::Evaluated, allow(), Hydrators::empty()),
+                },
+                Evaluation::Complete { verdict: allow() },
             ]
         );
     }
 
-    #[tokio::test]
-    async fn without_a_pure_core_answer_a_post_reads_as_an_original() {
-        let judged = |sources: InMemorySources| {
-            let nullcast = TweetFeatures {
-                is_nullcast: true,
-                ..Default::default()
-            };
-            let sources = Arc::new(sources.tweet_features(1, nullcast));
-            async move {
-                service(&sources)
-                    .run(FilterRequest {
-                        viewer_id: Some(50),
-                        country_code: None,
-                        client_capability: ClientCapability::default(),
-                        safety_level: SafetyLevel::TimelineHome,
-                        candidates: vec![candidate(1, Some(10))],
-                        rpc: Rpc::FilterTweets,
-                    })
-                    .await
-                    .outcomes
-                    .into_iter()
-                    .map(|outcome| (outcome.status, outcome.verdict, outcome.rested_on))
-                    .collect::<Vec<_>>()
+    #[derive(Clone, Copy, Debug)]
+    enum PureCore {
+        Found,
+        NotFound,
+        Failed,
+        FailedCacheHit,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TweetRow {
+        Found,
+        NotFound,
+        Failed,
+        FailedCacheHit,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Author {
+        Found,
+        Partial,
+        NotFound,
+        Failed,
+        FailedCacheHit,
+    }
+
+    fn lookups(
+        pure_core: PureCore,
+        tweet_row: TweetRow,
+        author: Author,
+    ) -> (InMemorySources, Vec<Source>) {
+        let mut broken = Vec::new();
+        let sources = InMemorySources::default()
+            .with_tweet_cache(tweet_fallback_cache(8))
+            .with_author_cache(author_fallback_cache(8));
+        let sources = match pure_core {
+            PureCore::Found => sources.tweet(1, 10),
+            PureCore::NotFound => sources,
+            PureCore::Failed => sources.tweet(1, 10).fail_key(Source::TesPureCore, 1),
+            PureCore::FailedCacheHit => {
+                broken.push(Source::TesPureCore);
+                sources.tweet(1, 10)
             }
         };
+        let nullcast = TweetFeatures {
+            is_nullcast: true,
+            ..Default::default()
+        };
+        let sources = match tweet_row {
+            TweetRow::Found => sources.tweet_features(1, nullcast),
+            TweetRow::NotFound => sources.without_tweet_row(1),
+            TweetRow::Failed => sources.fail_key(Source::TesTweet, 1),
+            TweetRow::FailedCacheHit => {
+                broken.push(Source::TesTweet);
+                sources.tweet_features(1, nullcast)
+            }
+        };
+        let sources = match author {
+            Author::Found => sources.authors(&[10]),
+            Author::Partial => sources.user(10, user(10, UserResponseState::Partial)),
+            Author::NotFound => sources,
+            Author::Failed => sources.fail_key(Source::GizmoduckAuthor, 10),
+            Author::FailedCacheHit => {
+                broken.push(Source::GizmoduckAuthor);
+                sources.authors(&[10])
+            }
+        };
+        (sources, broken)
+    }
+
+    #[tokio::test]
+    async fn a_post_is_judged_only_when_its_tweet_and_author_lookups_answer() {
         let nullcast_drop = dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop");
-        assert_eq!(
-            judged(InMemorySources::default().fault(Source::TesPureCore, Fault::Fails)).await,
-            [(
-                EvaluationStatus::Failed,
-                nullcast_drop.clone(),
-                Hydrators::of(Hydrator::PureCore).with(Hydrator::MuteRetweets),
-            )]
+        let judged = Evaluation::Complete {
+            verdict: nullcast_drop.clone(),
+        };
+        let not_found = Evaluation::NotFound;
+        let failed = Evaluation::Failed;
+        let rows = [
+            (
+                PureCore::Found,
+                TweetRow::Found,
+                Author::Found,
+                judged.clone(),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::NotFound,
+                Author::Found,
+                not_found(Lookup::Tweet),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::Failed,
+                Author::Found,
+                failed(Lookup::Tweet),
+            ),
+            (
+                PureCore::NotFound,
+                TweetRow::Found,
+                Author::Found,
+                not_found(Lookup::Tweet),
+            ),
+            (
+                PureCore::NotFound,
+                TweetRow::NotFound,
+                Author::Found,
+                not_found(Lookup::Tweet),
+            ),
+            (
+                PureCore::NotFound,
+                TweetRow::Failed,
+                Author::Found,
+                not_found(Lookup::Tweet),
+            ),
+            (
+                PureCore::Failed,
+                TweetRow::Found,
+                Author::Found,
+                failed(Lookup::Tweet),
+            ),
+            (
+                PureCore::Failed,
+                TweetRow::NotFound,
+                Author::Found,
+                not_found(Lookup::Tweet),
+            ),
+            (
+                PureCore::Failed,
+                TweetRow::Failed,
+                Author::Found,
+                failed(Lookup::Tweet),
+            ),
+            (
+                PureCore::FailedCacheHit,
+                TweetRow::Found,
+                Author::Found,
+                judged.clone(),
+            ),
+            (
+                PureCore::FailedCacheHit,
+                TweetRow::NotFound,
+                Author::Found,
+                not_found(Lookup::Tweet),
+            ),
+            (
+                PureCore::FailedCacheHit,
+                TweetRow::Failed,
+                Author::Found,
+                failed(Lookup::Tweet),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::FailedCacheHit,
+                Author::Found,
+                judged.clone(),
+            ),
+            (
+                PureCore::FailedCacheHit,
+                TweetRow::FailedCacheHit,
+                Author::FailedCacheHit,
+                judged.clone(),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::Found,
+                Author::Partial,
+                Evaluation::Partial {
+                    verdict: nullcast_drop,
+                    fail_open_defaults: Hydrators::of(Hydrator::AuthorSafety),
+                },
+            ),
+            (
+                PureCore::Found,
+                TweetRow::Found,
+                Author::NotFound,
+                not_found(Lookup::Author),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::Found,
+                Author::Failed,
+                failed(Lookup::Author),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::Found,
+                Author::FailedCacheHit,
+                judged,
+            ),
+        ];
+        for (pure_core, tweet_row, author, expected) in rows {
+            for request_author_id in [None, Some(10)] {
+                let (sources, broken) = lookups(pure_core, tweet_row, author);
+                let sources = Arc::new(sources);
+                let run = || async {
+                    service(&sources)
+                        .run(FilterRequest {
+                            viewer_id: Some(50),
+                            country_code: None,
+                            client_capability: ClientCapability::default(),
+                            safety_level: SafetyLevel::TimelineHome,
+                            candidates: vec![candidate(1, request_author_id)],
+                            rpc: Rpc::FilterTweets,
+                        })
+                        .await
+                        .outcomes
+                        .remove(0)
+                        .evaluation
+                };
+                run().await;
+                for source in broken {
+                    sources.break_source(source, Fault::Fails);
+                }
+                assert_eq!(
+                    run().await,
+                    expected,
+                    "{pure_core:?} {tweet_row:?} {author:?} {request_author_id:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_failed_for_one_request_author_of_a_repeated_tweet_fails_every_occurrence() {
+        let sources = Arc::new(
+            InMemorySources::default()
+                .tweet(1, 10)
+                .authors(&[11])
+                .fail_key(Source::GizmoduckAuthor, 10),
         );
+        let outcomes = service(&sources)
+            .run(FilterRequest {
+                viewer_id: Some(50),
+                country_code: None,
+                client_capability: ClientCapability::default(),
+                safety_level: SafetyLevel::TimelineHome,
+                candidates: vec![candidate(1, Some(10)), candidate(1, Some(11))],
+                rpc: Rpc::FilterTweets,
+            })
+            .await
+            .outcomes;
         assert_eq!(
-            judged(InMemorySources::default()).await,
-            [(
-                EvaluationStatus::Evaluated,
-                nullcast_drop,
-                Hydrators::empty()
-            )]
+            outcomes
+                .into_iter()
+                .map(|outcome| outcome.evaluation)
+                .collect::<Vec<_>>(),
+            vec![Evaluation::Failed(Lookup::Author); 2]
         );
     }
 
     #[tokio::test]
-    async fn run_preserves_order_duplicates_unresolved_authors_and_labels() {
+    async fn run_preserves_order_duplicates_unresolved_tweets_and_labels() {
         let labels = vf_pb::SafetyLabelMap {
             labels: HashMap::from([(999_999, vf_pb::SafetyLabel::default())]),
         };
         let sources = Arc::new(
             InMemorySources::default()
+                .tweet(2, 20)
+                .tweet_features(1, TweetFeatures::default())
+                .fail_key(Source::TesPureCore, 1)
+                .authors(&[20])
                 .labels(1, Default::default())
                 .labels(2, labels),
         );
@@ -479,21 +817,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![TweetId(2), TweetId(1), TweetId(2)]
         );
-        assert_eq!(response.outcomes[0].verdict, allow());
-        assert_eq!(response.outcomes[1].verdict, Verdict::unresolved_author());
         assert_eq!(
             response
                 .outcomes
                 .iter()
-                .map(|outcome| outcome.status)
+                .map(|outcome| outcome.evaluation.clone())
                 .collect::<Vec<_>>(),
             vec![
-                EvaluationStatus::Evaluated,
-                EvaluationStatus::UnresolvedAuthor,
-                EvaluationStatus::Evaluated
+                Evaluation::Complete { verdict: allow() },
+                Evaluation::Failed(Lookup::Tweet),
+                Evaluation::Complete { verdict: allow() },
             ]
         );
-        assert_eq!(response.outcomes[2].verdict, allow());
+        assert_eq!(
+            response.outcomes[1].evaluation.verdict(),
+            &Verdict::lookup_failed()
+        );
         assert!(response
             .outcomes
             .iter()

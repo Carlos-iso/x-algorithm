@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(ACTION_INDEX, 5);
         assert_eq!(ContinuousActionName::DwellTime as u32, 1);
         assert_eq!(ContinuousActionName::ClickDwellTime as u32, 2);
-        assert_eq!(ContinuousActionName::ActiveSecs5mResidualNorm as u32, 3);
+        assert_eq!(ContinuousActionName::HomeVideoContinuationSecs as u32, 3);
         assert_eq!(ContinuousActionName::BridgeProbability as u32, 4);
     }
 

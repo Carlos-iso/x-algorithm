@@ -1,10 +1,11 @@
 use crate::models::{MediaFeature, NsfwFeature, TweetFeatures};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
 use xai_core_entities::entities::{
-    EditControl, ExclusiveTweetControl, MediaEntity, TakedownReason,
+    EditControl, ExclusiveTweetControl, MediaEntity, TakedownReason, TrustedFriendsControl,
 };
 use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_strato::{encode, Bytes, MValCodec, StratoGrpc};
@@ -38,7 +39,13 @@ pub(crate) fn decode_tweet(bytes: &[u8]) -> Result<Option<TweetFeatures>> {
     match std::panic::catch_unwind(|| strato_decode::<Tweet>(bytes))
         .map_err(|_| anyhow!("MVal decoder panicked"))?
     {
-        Ok(StratoResult::Ok { value, .. }) => Ok(value.and_then(Tweet::project)),
+        Ok(StratoResult::Ok { value: None, .. }) => Ok(None),
+        Ok(StratoResult::Ok {
+            value: Some(tweet), ..
+        }) => tweet
+            .project()
+            .map(Some)
+            .ok_or_else(|| anyhow!("tweet value without coreData")),
         Ok(StratoResult::Err { code, message }) => {
             Err(anyhow!("Strato error code {code}: {message}"))
         }
@@ -51,13 +58,14 @@ struct Tweet {
     core_data: Option<CoreData>,
     media: Vec<MediaEntity>,
     takedown_reasons: Vec<TakedownReason>,
-    has_communities: bool,
+    community_id: Option<NonZeroU64>,
     exclusive_tweet_control: Option<ExclusiveTweetControl>,
-    has_trusted_friends_control: bool,
+    trusted_friends_list_id: Option<u64>,
     edit_control: Option<EditControl>,
     has_media_refs: bool,
     has_media_keys: bool,
     has_card_reference: bool,
+    article_id: Option<NonZeroU64>,
 }
 
 #[derive(Default)]
@@ -82,12 +90,13 @@ impl Tweet {
                 has_uploaded_media: self.has_media_keys,
                 ..media_feature(&self.media)
             },
-            is_community_tweet: self.has_communities,
-            is_trusted_friends_tweet: self.has_trusted_friends_control,
+            community_id: self.community_id,
+            trusted_friends_list_id: self.trusted_friends_list_id,
             edit_control: self.edit_control,
             exclusive_conversation_author_id: self
                 .exclusive_tweet_control
                 .map(|control| control.conversation_author_id),
+            article_id: self.article_id,
         })
     }
 }
@@ -143,16 +152,17 @@ impl TSerializable for Tweet {
                     proto.skip(field.field_type)?;
                     tweet.has_card_reference = true;
                 }
-                Some(125) => tweet.has_communities = read_communities_non_empty(proto)?,
+                Some(125) => tweet.community_id = read_first_community_id(proto)?,
                 Some(155) => {
                     tweet.exclusive_tweet_control = Some(ExclusiveTweetControl::from_thrift(proto));
                 }
                 Some(156) => {
-                    proto.skip(field.field_type)?;
-                    tweet.has_trusted_friends_control = true;
+                    tweet.trusted_friends_list_id =
+                        Some(TrustedFriendsControl::from_thrift(proto).trusted_friends_list_id);
                 }
                 Some(157) => tweet.edit_control = Some(EditControl::from_thrift(proto)),
                 Some(162) => tweet.has_media_refs = skip_list_non_empty(proto)?,
+                Some(170) => tweet.article_id = read_article_id(proto)?,
                 Some(32766) => tweet.has_media_keys = skip_list_non_empty(proto)?,
                 _ => proto.skip(field.field_type)?,
             }
@@ -199,22 +209,49 @@ fn skip_list_non_empty(proto: &mut dyn TInputProtocol) -> thrift::Result<bool> {
     Ok(list.size > 0)
 }
 
-fn read_communities_non_empty(proto: &mut dyn TInputProtocol) -> thrift::Result<bool> {
+fn read_first_community_id(proto: &mut dyn TInputProtocol) -> thrift::Result<Option<NonZeroU64>> {
     proto.read_struct_begin()?;
-    let mut non_empty = false;
+    let mut first = None;
     loop {
         let field = proto.read_field_begin()?;
         if field.field_type == TType::Stop {
             break;
         }
         match field.id {
-            Some(1) => non_empty = skip_list_non_empty(proto)?,
+            Some(1) => {
+                let list = proto.read_list_begin()?;
+                if list.size > 0 {
+                    first = NonZeroU64::new(proto.read_i64()?.cast_unsigned());
+                }
+                for _ in 1..list.size {
+                    proto.skip(list.element_type)?;
+                }
+                proto.read_list_end()?;
+            }
             _ => proto.skip(field.field_type)?,
         }
         proto.read_field_end()?;
     }
     proto.read_struct_end()?;
-    Ok(non_empty)
+    Ok(first)
+}
+
+fn read_article_id(proto: &mut dyn TInputProtocol) -> thrift::Result<Option<NonZeroU64>> {
+    proto.read_struct_begin()?;
+    let mut id = None;
+    loop {
+        let field = proto.read_field_begin()?;
+        if field.field_type == TType::Stop {
+            break;
+        }
+        match field.id {
+            Some(1) => id = NonZeroU64::new(proto.read_i64()?.cast_unsigned()),
+            _ => proto.skip(field.field_type)?,
+        }
+        proto.read_field_end()?;
+    }
+    proto.read_struct_end()?;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -234,6 +271,7 @@ mod tests {
     const AUTHOR_ID: i64 = 7001;
     const CONVERSATION_AUTHOR_ID: i64 = 7003;
     const TRUSTED_FRIENDS_LIST_ID: i64 = 9001;
+    const ARTICLE_ID: i64 = 9002;
 
     fn field(proto: &mut Proto<'_>, id: i16, ty: TType, value: impl FnOnce(&mut Proto<'_>)) {
         proto
@@ -392,6 +430,7 @@ mod tests {
                     })
                 });
                 list(p, 162, TType::Struct, 1, |p| bare_struct(p, |_| {}));
+                structure(p, 170, |p| i64_field(p, 1, ARTICLE_ID));
                 list(p, 32766, TType::Struct, 1, |p| bare_struct(p, |_| {}));
             },
         );
@@ -417,12 +456,22 @@ mod tests {
                     admin: false
                 },
                 is_nullcast: true,
-                is_community_tweet: true,
-                is_trusted_friends_tweet: true,
+                community_id: NonZeroU64::new(500),
+                trusted_friends_list_id: Some(TRUSTED_FRIENDS_LIST_ID as u64),
                 edit_control,
                 exclusive_conversation_author_id: Some(CONVERSATION_AUTHOR_ID as u64),
+                article_id: NonZeroU64::new(ARTICLE_ID as u64),
             }
         );
+    }
+
+    #[test]
+    fn an_article_with_id_0_is_no_article() {
+        let bytes = encode_tweet(&mut |_| {}, &mut |p| {
+            structure(p, 170, |p| i64_field(p, 1, 0));
+        });
+
+        assert_eq!(decode_fixture(&bytes).article_id, None);
     }
 
     #[test]
@@ -497,8 +546,15 @@ mod tests {
     }
 
     #[test]
-    fn community_tweet_requires_a_nonempty_community_id_list() {
-        for (community_ids, expected) in [(vec![500], true), (vec![], false)] {
+    fn community_id_is_the_first_of_the_community_id_list() {
+        for (community_ids, expected) in [
+            (vec![500, 600], NonZeroU64::new(500)),
+            (
+                vec![1_500_000_000_000_000_000],
+                NonZeroU64::new(1_500_000_000_000_000_000),
+            ),
+            (vec![], None),
+        ] {
             let bytes = encode_tweet(&mut |_| {}, &mut |p| {
                 structure(p, 125, |p| {
                     list(p, 1, TType::I64, community_ids.len(), |p| {
@@ -506,10 +562,18 @@ mod tests {
                             p.write_i64(*id).unwrap();
                         }
                     });
+                    field(p, 2, TType::String, |p| p.write_string("channel").unwrap());
                 });
+                structure(p, 155, |p| i64_field(p, 1, CONVERSATION_AUTHOR_ID));
             });
 
-            assert_eq!(decode_fixture(&bytes).is_community_tweet, expected);
+            let features = decode_fixture(&bytes);
+            assert_eq!(features.community_id, expected, "{community_ids:?}");
+            assert_eq!(
+                features.exclusive_conversation_author_id,
+                Some(CONVERSATION_AUTHOR_ID as u64),
+                "{community_ids:?}: the field after communities did not decode"
+            );
         }
     }
 
@@ -529,12 +593,13 @@ mod tests {
     }
 
     #[test]
-    fn absent_value_or_missing_core_data_decodes_as_missing() {
-        for bytes in [
-            encode_option(&mut |p| field(p, 9048, TType::Void, |_| {})),
-            encode_option(&mut |p| structure(p, 26900, |p| i64_field(p, 1, TWEET_ID))),
-        ] {
-            assert!(decode_tweet(&bytes).unwrap().is_none());
-        }
+    fn an_absent_value_is_missing_and_a_value_without_core_data_is_an_error() {
+        let absent = encode_option(&mut |p| field(p, 9048, TType::Void, |_| {}));
+        assert!(decode_tweet(&absent).unwrap().is_none());
+
+        let without_core_data =
+            encode_option(&mut |p| structure(p, 26900, |p| i64_field(p, 1, TWEET_ID)));
+        let error = decode_tweet(&without_core_data).unwrap_err();
+        assert_eq!(error.to_string(), "tweet value without coreData");
     }
 }

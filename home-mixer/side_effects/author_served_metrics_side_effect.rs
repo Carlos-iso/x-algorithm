@@ -1,9 +1,7 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{
-    AuthorServedMetricsAuthorIds, EnableAuthorServedMetricsExperimentBucket, PopularPostsTopAuthors,
-};
-use crate::util::popular_authors::PopularAuthorsCache;
+use crate::params::{AuthorServedMetricsAuthorIds, EnableAuthorServedMetricsExperimentBucket};
+use crate::util::popular_authors::{now_ms, PopularAuthorsCache};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,6 +10,9 @@ use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_stats_receiver::global_stats_receiver;
 
 const SERVED_METRIC: &str = "AuthorServedMetrics.Served";
+const SCORED_METRIC: &str = "AuthorServedMetrics.Scored";
+const SERVED_TOP10_METRIC: &str = "AuthorServedMetrics.ServedTop10";
+const TOP10: usize = 10;
 const REQUESTS_METRIC: &str = "AuthorServedMetrics.Requests";
 const PAGE_SLOTS_METRIC: &str = "AuthorServedMetrics.PageSlots";
 const POST_UNEXPLORED_METRIC: &str = "AuthorServedMetrics.PostUnexplored";
@@ -117,9 +118,9 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for AuthorServedMetricsSideEffe
             receiver.incr(REQUESTS_METRIC, &[("ddg", ddg), ("bucket", bucket)], 1);
         }
 
-        let top_k = params.get(PopularPostsTopAuthors) as usize;
+        self.popular_authors.maybe_spawn_refresh(now_ms());
         let page = served_page_stats(&input.selected_candidates, |author_id| {
-            self.popular_authors.contains_top(author_id, top_k)
+            self.popular_authors.contains(author_id)
         });
         for ((range, _), stats) in PAGE_RANGES.iter().zip(page) {
             for (ddg, bucket) in &buckets {
@@ -160,20 +161,34 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for AuthorServedMetricsSideEffe
         if tracked.is_empty() {
             return Ok(());
         }
-        let counts = aggregate_counts(&input.selected_candidates, &tracked);
-        for ((author_id, post_type), count) in counts {
-            let author_str = author_id.to_string();
-            for (ddg, bucket) in &buckets {
-                receiver.incr(
-                    SERVED_METRIC,
-                    &[
-                        ("type", post_type.as_str()),
-                        ("author_id", &author_str),
-                        ("ddg", ddg),
-                        ("bucket", bucket),
-                    ],
-                    count,
-                );
+        let served = aggregate_counts(&input.selected_candidates, &tracked);
+        let served_top10 = aggregate_counts(
+            &input.selected_candidates[..input.selected_candidates.len().min(TOP10)],
+            &tracked,
+        );
+        let mut scored = aggregate_counts(&input.non_selected_candidates, &tracked);
+        for (key, count) in &served {
+            *scored.entry(*key).or_insert(0) += count;
+        }
+        for (metric, counts) in [
+            (SERVED_METRIC, served),
+            (SERVED_TOP10_METRIC, served_top10),
+            (SCORED_METRIC, scored),
+        ] {
+            for ((author_id, post_type), count) in counts {
+                let author_str = author_id.to_string();
+                for (ddg, bucket) in &buckets {
+                    receiver.incr(
+                        metric,
+                        &[
+                            ("type", post_type.as_str()),
+                            ("author_id", &author_str),
+                            ("ddg", ddg),
+                            ("bucket", bucket),
+                        ],
+                        count,
+                    );
+                }
             }
         }
 

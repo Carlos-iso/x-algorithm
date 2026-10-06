@@ -204,9 +204,10 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
                                              ▼
 ┌───────────────────  4. VISIBILITY FILTERING   <a href="visibility-filtering/">visibility-filtering/</a>  ────────────────────┐
 │                                                                                          │
-│    for each post and viewer, one of three answers:                                       │
+│    for each post and viewer, one of four answers:                                        │
 │                                                                                          │
 │       ALLOW          show the post normally                                              │
+│       NOTICE         show the post with a notice attached to it                          │
 │       INTERSTITIAL   show it behind an interstitial the viewer can tap                   │
 │                      through, e.g. for adult or graphic media                            │
 │       DROP           do not show it                                                      │
@@ -227,6 +228,8 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
 │               itself dropped                                                             │
 │    interstitial  ──►  the post stays in the feed; nothing in this                        │
 │               repository draws the interstitial                                          │
+│    notice  ──►  the post stays in the feed; nothing in this                              │
+│               repository draws the notice                                                │
 │                                                                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 </pre>
@@ -335,7 +338,7 @@ Phoenix predicts a probability for each action:
 ```
 Engagement    favorite · reply · repost · quote · share · share via DM · share via copy link
 Clicks        post · profile · link · photo expand · video open · quoted post
-Attention     video quality view · dwell · dwell time · click dwell time · active seconds
+Attention     video quality view · dwell · dwell time · click dwell time · video continuation seconds · profile visit seconds
 Author        follow author
 Negative      not interested · mute author · block author · report · not dwelled
 ```

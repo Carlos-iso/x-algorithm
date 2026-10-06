@@ -1,7 +1,6 @@
 import os
 import logging
 from pathlib import Path
-from typing import Literal
 
 from pydantic import Field, BaseModel, ConfigDict
 from monitor.config import LoggingConfig, MetricsConfig
@@ -247,7 +246,6 @@ class GroxConfig(BaseSettings):
     kerberos: KerberosConfig = KerberosConfig()
     asr: ASRConfig = ASRConfig()
     prompt_tokens: PromptTokensConfig = PromptTokensConfig()
-    enrichment_write: Literal["mh", "both_mh"] = "mh"
 
     model_config = SettingsConfigDict(yaml_file=_get_config_file_paths(), frozen=True)
 

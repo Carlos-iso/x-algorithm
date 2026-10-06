@@ -9,7 +9,7 @@ pub struct AuthorFeatures {
     pub is_offboarded: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::VariantArray)]
 #[repr(u8)]
 pub enum AuthorLabel {
     NsfwHighRecall,

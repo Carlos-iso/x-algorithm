@@ -1,21 +1,12 @@
 use crate::models::AuthorLabel;
 use crate::rules::rule_spec::{
-    drop_post, everyone, except_author, rule, AuthorPredicate, Condition, Predicate,
-    RelationshipPredicate, RuleClause, RuleId, TweetPredicate, ViewerPredicate,
+    author, drop_post, everyone, except_author, not, relationship, rule, tweet, viewer,
+    AuthorPredicate, Condition, RelationshipPredicate, RuleClause, RuleId, TweetPredicate,
+    ViewerPredicate,
 };
 use xai_visibility_filtering::models::FilteredReason;
 
-const NOT_FOLLOWER: Condition = Condition::Not(Predicate::Relationship(
-    RelationshipPredicate::ViewerFollowsAuthor,
-));
-
-const fn author(leaf: AuthorPredicate) -> Condition {
-    Condition::Holds(Predicate::Author(leaf))
-}
-
-const fn relationship(leaf: RelationshipPredicate) -> Condition {
-    Condition::Holds(Predicate::Relationship(leaf))
-}
+const NOT_FOLLOWER: Condition = not(relationship(RelationshipPredicate::ViewerFollowsAuthor));
 
 fn author_drop(id: RuleId, state: AuthorPredicate, reason: FilteredReason) -> Vec<RuleClause> {
     rule(id, except_author([author(state)], drop_post(reason)))
@@ -153,7 +144,7 @@ pub(super) fn oon_user_label_drops() -> Vec<RuleClause> {
 }
 
 pub(super) fn socialgraph_drops() -> Vec<RuleClause> {
-    const NOT_LOGGED_OUT: Condition = Condition::Not(Predicate::Viewer(ViewerPredicate::LoggedOut));
+    const NOT_LOGGED_OUT: Condition = not(viewer(ViewerPredicate::LoggedOut));
     [
         rule(
             RuleId::ViewerBlocksAuthor,
@@ -180,7 +171,7 @@ pub(super) fn socialgraph_drops() -> Vec<RuleClause> {
             everyone(
                 [
                     NOT_LOGGED_OUT,
-                    Condition::Holds(Predicate::Tweet(TweetPredicate::IsRetweet)),
+                    tweet(TweetPredicate::IsRetweet),
                     relationship(RelationshipPredicate::ViewerMutesRetweetsFromAuthor),
                 ],
                 drop_post(FilteredReason::UnspecifiedReason),

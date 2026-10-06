@@ -23,6 +23,7 @@ pub struct ValueModelWeights {
     pub quoted_vqv: f64,
     pub follow_author: f64,
     pub post_unexplored: f64,
+    pub post_unexplored_include_out_of_network: bool,
     pub not_interested: f64,
     pub block_author: f64,
     pub mute_author: f64,
@@ -30,6 +31,9 @@ pub struct ValueModelWeights {
     pub not_dwelled: f64,
     pub cont_dwell_time: f64,
     pub cont_click_dwell_time: f64,
+    pub video_continuation: f64,
+    pub user_video_continuation: f64,
+    pub profile_visit_secs: f64,
     pub min_video_duration_ms: i32,
     pub enable_quoted_vqv_duration_check: bool,
     pub bidirectional_follow_reply_weight_boost: f64,
@@ -103,7 +107,7 @@ impl ValueModelWeights {
         self
     }
 
-    fn weights_mut(&mut self) -> [(&'static str, &mut f64); 25] {
+    fn weights_mut(&mut self) -> [(&'static str, &mut f64); 28] {
         [
             ("favorite", &mut self.favorite),
             ("reply", &mut self.reply),
@@ -123,6 +127,9 @@ impl ValueModelWeights {
             ("quoted_vqv", &mut self.quoted_vqv),
             ("dwell_time", &mut self.cont_dwell_time),
             ("click_dwell_time", &mut self.cont_click_dwell_time),
+            ("video_continuation", &mut self.video_continuation),
+            ("user_video_continuation", &mut self.user_video_continuation),
+            ("profile_visit_secs", &mut self.profile_visit_secs),
             ("follow_author", &mut self.follow_author),
             ("post_unexplored", &mut self.post_unexplored),
             ("not_interested", &mut self.not_interested),

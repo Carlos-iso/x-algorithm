@@ -5,6 +5,7 @@ use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params;
 use crate::server::{PipelineOutput, QueryBuilder};
+use crate::util::under_the_hood;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,6 +47,7 @@ impl ScoredPostsServer {
             return Ok(PipelineOutput {
                 scored_posts: vec![],
                 pipeline_result: PipelineResult::empty(),
+                pipeline_trace: None,
             });
         }
 
@@ -53,7 +55,8 @@ impl ScoredPostsServer {
 
         let start = Instant::now();
 
-        let pipeline_result = self.phoenix_candidate_pipeline.execute(query).await;
+        let (pipeline_result, pipeline_trace) =
+            self.phoenix_candidate_pipeline.execute_traced(query).await;
 
         info!(
             "Scored Posts response - request_id {} - {} posts ({} ms)",
@@ -64,17 +67,25 @@ impl ScoredPostsServer {
 
         log_response_stats(&pipeline_result);
 
-        let scored_posts = candidates_to_scored_posts(&pipeline_result.selected_candidates);
-
+        let scored_posts = candidates_to_scored_posts(
+            &pipeline_result.query,
+            &pipeline_result.selected_candidates,
+        );
         Ok(PipelineOutput {
             scored_posts,
+            pipeline_trace: pipeline_trace
+                .filter(|_| pipeline_result.query.is_under_the_hood_request)
+                .map(|trace| under_the_hood::pipeline_trace(&trace)),
             pipeline_result,
         })
     }
 }
 
 
-fn candidates_to_scored_posts(candidates: &[PostCandidate]) -> Vec<ScoredPost> {
+fn candidates_to_scored_posts(
+    query: &ScoredPostsQuery,
+    candidates: &[PostCandidate],
+) -> Vec<ScoredPost> {
     candidates
         .iter()
         .map(|candidate| {
@@ -119,6 +130,9 @@ fn candidates_to_scored_posts(candidates: &[PostCandidate]) -> Vec<ScoredPost> {
                 topic_feedback_topic_id: candidate.topic_feedback_topic_id.clone(),
                 ai_trend_name: candidate.ai_trend_name.clone(),
                 ai_trend_id: candidate.ai_trend_id.clone(),
+                under_the_hood: query
+                    .is_under_the_hood_request
+                    .then(|| under_the_hood::post_scores(query, candidate)),
             }
         })
         .collect()

@@ -108,6 +108,7 @@ pub struct ScoredPostsQuery {
     pub user_installed_apps: Option<Vec<bool>>,
     pub subscription_level: Option<SubscriptionLevel>,
     pub is_shadow_traffic: bool,
+    pub is_under_the_hood_request: bool,
     pub is_preview: bool,
     pub is_polling: bool,
     #[serde(serialize_with = "serialize_debug")]
@@ -220,6 +221,7 @@ impl ScoredPostsQuery {
             user_installed_apps: None,
             subscription_level,
             is_shadow_traffic,
+            is_under_the_hood_request: false,
             is_preview,
             is_polling: false,
             cursor: None,

@@ -64,6 +64,24 @@ param!(
     0.4
 );
 param!(
+    VideoContinuationWeight,
+    f64,
+    "rust_home_mixer_video_continuation_weight",
+    0.0
+);
+param!(
+    UserVideoContinuationWeight,
+    f64,
+    "rust_home_mixer_user_video_continuation_weight",
+    0.0
+);
+param!(
+    ProfileVisitSecsWeight,
+    f64,
+    "rust_home_mixer_profile_visit_secs_weight",
+    0.0
+);
+param!(
     FollowAuthorWeight,
     f64,
     "rust_home_mixer_follow_author_weight",
@@ -74,6 +92,12 @@ param!(
     f64,
     "rust_home_mixer_post_unexplored_weight",
     0.02
+);
+param!(
+    PostUnexploredIncludeOutOfNetwork,
+    bool,
+    "rust_home_mixer_post_unexplored_include_out_of_network",
+    false
 );
 param!(
     NotInterestedWeight,

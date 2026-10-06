@@ -592,10 +592,10 @@ enum ActionName {
 }
 
 enum ContinuousActionName {
-  INVALID_CONTINUOUS_ACTION_NAME = 0;
+  HOME_PROFILE_VISIT_SECS = 0;
   DWELL_TIME = 1;
   CLICK_DWELL_TIME = 2;
-  ACTIVE_SECS_5M_RESIDUAL_NORM = 3;
+  HOME_VIDEO_CONTINUATION_SECS = 3;
   BRIDGE_PROBABILITY = 4;
   ADS_WEB_CT_PURCHASE_VALUE = 5;
   WEB_CONV_VALUE_USD = 6;
@@ -1378,6 +1378,8 @@ message ScoreInfo {
   optional double rewardRerankSlotProb = 5;
   optional uint32 rerankerHeadTag = 6;
   optional double pageDecodeSlotProb = 7;
+  repeated uint32 predictionHeads = 8;
+  repeated float predictionValues = 9;
 }
 
 message SlateContext {
@@ -1810,7 +1812,7 @@ enum UserActionAggregationType {
   ADS_CHAD_WITH_CONV_TYPES = 27;
   ADS_WITH_KV_AD_HISTORY = 28;
   IMMERSIVE_LONG_DWELL = 29;
-  PLACEHOLDER_30 = 30;
+  DENSE_WITH_LONG_DWELL_HOME_EXCURSION = 30;
   PLACEHOLDER_31 = 31;
   PLACEHOLDER_32 = 32;
 }

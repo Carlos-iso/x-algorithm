@@ -1391,8 +1391,8 @@ class RecsysTrainer(Trainer):
             )
             batches = jax.tree.map(lambda *x: jnp.stack(x), *data)
             gate = gate + jnp.stack(jax.tree.leaves(loss_normalizers)).sum().astype(gate.dtype)
-            assert segment_ids is not None
-            gate = gate + recsys_async_emb.zero_pin(ctx, segment_ids[0])[0].astype(gate.dtype)
+            if segment_ids is not None:
+                gate = gate + recsys_async_emb.zero_pin(ctx, segment_ids[0])[0].astype(gate.dtype)
 
         update_start_pin, updating_table, updating_emb_state, emb_optim_metrics = (
             self._emb_optim.gradient_update_start(
@@ -1798,8 +1798,6 @@ class RecsysTrainer(Trainer):
             raise ValueError("num_microbatch > 1 supports only the ranker")
         if self.num_microbatch > 1 and self.empty_history_augmentation_rate > 0:
             raise ValueError("num_microbatch > 1 does not support empty_history_augmentation_rate")
-        if self.num_microbatch > 1 and self.use_row_emb:
-            raise ValueError("num_microbatch > 1 does not support use_row_emb yet")
 
         self._init_shmem_write_pool()
         self._free_ports()

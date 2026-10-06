@@ -1,10 +1,10 @@
-use crate::hydration::batch::{Hydrated, HydrationBatch};
+use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
+use crate::hydration::Cause;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 pub(super) struct Fetcher<V> {
     states: HashMap<u64, State<V>>,
-    has_incomplete: bool,
 }
 
 enum State<V> {
@@ -12,11 +12,19 @@ enum State<V> {
     Landed(Hydrated<V>),
 }
 
+impl<V> State<V> {
+    fn is_complete(&self) -> bool {
+        match self {
+            State::Landed(answer) => answer.is_complete(),
+            State::Pending => false,
+        }
+    }
+}
+
 impl<V> Default for Fetcher<V> {
     fn default() -> Self {
         Self {
             states: HashMap::new(),
-            has_incomplete: false,
         }
     }
 }
@@ -25,8 +33,9 @@ impl<V> Fetcher<V> {
     pub(super) fn land(&mut self, claimed: &[u64], batch: HydrationBatch<u64, V>) {
         let mut answers = batch.into_hydrated();
         for &key in claimed {
-            let answer = answers.remove(&key).unwrap_or(Hydrated::NotFound);
-            self.has_incomplete |= !answer.is_complete();
+            let answer = answers.remove(&key);
+            debug_assert!(answer.is_some(), "a call answers every key it claimed");
+            let answer = answer.unwrap_or(Hydrated::Failed(HydrationError::Error));
             self.states.insert(key, State::Landed(answer));
         }
     }
@@ -52,6 +61,7 @@ pub(super) trait AnyFetcher {
     fn is_claimed(&self, key: u64) -> bool;
     fn has_incomplete(&self) -> bool;
     fn is_incomplete(&self, key: u64) -> bool;
+    fn miss(&self, key: u64) -> Option<Cause>;
 }
 
 impl<V> AnyFetcher for Fetcher<V> {
@@ -76,25 +86,34 @@ impl<V> AnyFetcher for Fetcher<V> {
     }
 
     fn has_incomplete(&self) -> bool {
-        self.has_incomplete
+        self.states.values().any(|state| !state.is_complete())
     }
 
     fn is_incomplete(&self, key: u64) -> bool {
-        matches!(self.states.get(&key), Some(State::Landed(answer)) if !answer.is_complete())
+        self.states
+            .get(&key)
+            .is_some_and(|state| !state.is_complete())
+    }
+
+    fn miss(&self, key: u64) -> Option<Cause> {
+        match self.states.get(&key) {
+            Some(State::Landed(Hydrated::Found(_) | Hydrated::Partial(_))) => None,
+            Some(State::Landed(Hydrated::NotFound)) => Some(Cause::NotFound),
+            Some(State::Landed(Hydrated::Failed(_)) | State::Pending) | None => Some(Cause::Failed),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::batch::HydrationError;
 
     #[test]
     fn only_found_and_not_found_keys_are_complete() {
         let mut fetcher = Fetcher::default();
-        let keys = fetcher.claim(vec![1, 2, 3, 4]);
+        let keys = fetcher.claim(vec![1, 2, 3, 4, 5]);
         fetcher.land(
-            &keys,
+            &keys[..4],
             HydrationBatch::from_hydrated(HashMap::from([
                 (1, Hydrated::Found(7)),
                 (2, Hydrated::NotFound),
@@ -107,7 +126,19 @@ mod tests {
             .into_iter()
             .filter(|&key| fetcher.is_incomplete(key))
             .collect();
-        assert_eq!(incomplete, [3, 4]);
+        assert_eq!(incomplete, [3, 4, 5]);
         assert_eq!(fetcher.get(3), Some(&7));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a call answers every key it claimed")]
+    fn a_call_that_leaves_out_a_claimed_key_breaks_the_fetcher_contract() {
+        let mut fetcher = Fetcher::default();
+        let keys = fetcher.claim(vec![1, 2]);
+        fetcher.land(
+            &keys,
+            HydrationBatch::from_hydrated(HashMap::from([(1, Hydrated::Found(7))])),
+        );
     }
 }

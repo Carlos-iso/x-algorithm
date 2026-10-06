@@ -4,14 +4,15 @@ use crate::models::{
 };
 use crate::params::CountryList;
 use crate::rules::rule_spec::{
-    blur, blur_with_age_prompt, drop_post, everyone, except_author, family, limit,
-    nsfw_viewer_drop, only_when, rule, tombstone, AuthorPredicate, Clause, Condition, Predicate,
-    RelationshipPredicate, RuleClause, RuleId, TweetPredicate, ViewerPredicate,
+    author, blur, blur_with_age_prompt, drop_post, everyone, except_author, family,
+    has_tweet_label, has_user_label, label, limit, not, nsfw_viewer_drop, only_when, relationship,
+    rule, soft_intervention, tombstone, tweet, viewer, AuthorPredicate, Clause, Condition,
+    Predicate, RelationshipPredicate, RuleClause, RuleId, TweetPredicate, ViewerPredicate,
     LEGACY_NSFW_INTERSTITIAL,
 };
 use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::{Action, FilteredReason, SafetyResult, SafetyResultReason};
-use xai_x_thrift::action::InterstitialReason;
+use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
 
 pub(super) const NSFW_HIGH_PRECISION_REASON: FilteredReason =
     FilteredReason::SafetyResult(SafetyResult {
@@ -19,34 +20,9 @@ pub(super) const NSFW_HIGH_PRECISION_REASON: FilteredReason =
         action: Action::Drop(xai_visibility_filtering::models::DropReason {}),
     });
 
-const fn has_tweet_label(label: SafetyLabelType) -> Predicate {
-    Predicate::Tweet(TweetPredicate::HasSafetyLabel(label))
-}
-
-const fn has_user_label(label: AuthorLabel) -> Predicate {
-    Predicate::Author(AuthorPredicate::HasUserLabel(label))
-}
-
-const fn label(label: SafetyLabelType) -> Condition {
-    Condition::Holds(has_tweet_label(label))
-}
-
-const fn tweet(leaf: TweetPredicate) -> Condition {
-    Condition::Holds(Predicate::Tweet(leaf))
-}
-
-const fn viewer(leaf: ViewerPredicate) -> Condition {
-    Condition::Holds(Predicate::Viewer(leaf))
-}
-
-const fn relationship(leaf: RelationshipPredicate) -> Condition {
-    Condition::Holds(Predicate::Relationship(leaf))
-}
-
 const HAS_MEDIA: Condition = tweet(TweetPredicate::HasMedia);
-const NOT_RETWEET: Condition = Condition::Not(Predicate::Tweet(TweetPredicate::IsRetweet));
-const SENSITIVE_MEDIA_DISABLED: Condition =
-    Condition::Not(Predicate::Viewer(ViewerPredicate::AllowsSensitiveMedia));
+const NOT_RETWEET: Condition = not(tweet(TweetPredicate::IsRetweet));
+const SENSITIVE_MEDIA_DISABLED: Condition = not(viewer(ViewerPredicate::AllowsSensitiveMedia));
 const LOGGED_OUT: Condition = viewer(ViewerPredicate::LoggedOut);
 const UNDERAGE: Condition = viewer(ViewerPredicate::Underage);
 const NO_STATED_AGE: Condition = viewer(ViewerPredicate::NoStatedAge);
@@ -69,17 +45,17 @@ const NSFW_TEXT_OR_CARD_LABEL: Condition = Condition::AnyOf(&[
     has_tweet_label(SafetyLabelType::NSFW_CARD_IMAGE),
 ]);
 const HAS_EXCLUSIVE_CONTENT: Condition = tweet(TweetPredicate::HasExclusiveContent);
-const NOT_CONVERSATION_AUTHOR: Condition = Condition::Not(Predicate::Relationship(
+const NOT_CONVERSATION_AUTHOR: Condition = not(relationship(
     RelationshipPredicate::ViewerIsConversationAuthor,
 ));
-const NOT_SUPER_FOLLOWER: Condition = Condition::Not(Predicate::Relationship(
+const NOT_SUPER_FOLLOWER: Condition = not(relationship(
     RelationshipPredicate::ViewerSuperFollowsAuthor,
 ));
-const NOT_LOGGED_OUT: Condition = Condition::Not(Predicate::Viewer(ViewerPredicate::LoggedOut));
-const NOT_CONVERSATION_ROOT_AUTHOR: Condition = Condition::Not(Predicate::Relationship(
+const NOT_LOGGED_OUT: Condition = not(viewer(ViewerPredicate::LoggedOut));
+const NOT_CONVERSATION_ROOT_AUTHOR: Condition = not(relationship(
     RelationshipPredicate::ViewerIsConversationRootAuthor,
 ));
-const NOT_INVITED_TO_CONVERSATION: Condition = Condition::Not(Predicate::Relationship(
+const NOT_INVITED_TO_CONVERSATION: Condition = not(relationship(
     RelationshipPredicate::ViewerIsInvitedToConversation,
 ));
 
@@ -89,7 +65,37 @@ pub(super) fn protected_community_tweet_drop() -> Vec<RuleClause> {
         except_author(
             [
                 tweet(TweetPredicate::IsCommunityTweet),
-                Condition::Holds(Predicate::Author(AuthorPredicate::IsProtected)),
+                author(AuthorPredicate::IsProtected),
+            ],
+            drop_post(FilteredReason::UnspecifiedReason),
+        ),
+    )
+}
+
+pub(super) fn hidden_community_tweet_drop() -> Vec<RuleClause> {
+    moderated_community_tweet_drop(
+        RuleId::HiddenCommunityTweet,
+        TweetPredicate::CommunityTweetIsHidden,
+    )
+}
+
+pub(super) fn author_removed_community_tweet_drop() -> Vec<RuleClause> {
+    moderated_community_tweet_drop(
+        RuleId::AuthorRemovedCommunityTweet,
+        TweetPredicate::CommunityTweetAuthorIsRemoved,
+    )
+}
+
+fn moderated_community_tweet_drop(id: RuleId, moderated: TweetPredicate) -> Vec<RuleClause> {
+    rule(
+        id,
+        except_author(
+            [
+                tweet(TweetPredicate::IsCommunityTweet),
+                tweet(moderated),
+                not(relationship(
+                    RelationshipPredicate::ViewerIsCommunityModerator,
+                )),
             ],
             drop_post(FilteredReason::UnspecifiedReason),
         ),
@@ -204,7 +210,7 @@ const NSFW_HIGH_PRECISION_CHANGED_AT: u64 = 1705536000000;
 const NSFW_HIGH_PRECISION: Condition = label(SafetyLabelType::NSFW_HIGH_PRECISION);
 const CREATED_AFTER_NSFW_HIGH_PRECISION_CHANGE: Condition =
     tweet(TweetPredicate::CreatedAfter(NSFW_HIGH_PRECISION_CHANGED_AT));
-const CREATED_BEFORE_NSFW_HIGH_PRECISION_CHANGE: Condition = Condition::Not(Predicate::Tweet(
+const CREATED_BEFORE_NSFW_HIGH_PRECISION_CHANGE: Condition = not(tweet(
     TweetPredicate::CreatedAfter(NSFW_HIGH_PRECISION_CHANGED_AT),
 ));
 const GORE_AND_VIOLENCE_HIGH_PRECISION: Condition =
@@ -234,14 +240,12 @@ const CLIENT_HAS_VERIFY_BLUR: Condition = viewer(ViewerPredicate::ClientVerifyBl
 const REQUEST_IS_FROM_AGE_VERIFICATION_COUNTRIES: Condition = viewer(
     ViewerPredicate::RequestCountryIn(CountryList::AgeVerification),
 );
-const VIEWER_IS_NOT_AGE_VERIFIED: Condition =
-    Condition::Not(Predicate::Viewer(ViewerPredicate::AgeVerified));
+const VIEWER_IS_NOT_AGE_VERIFIED: Condition = not(viewer(ViewerPredicate::AgeVerified));
 const REQUEST_IS_FROM_LOCAL_REGULATIONS_COUNTRIES: Condition = viewer(
     ViewerPredicate::RequestCountryIn(CountryList::LocalRegulations),
 );
 const MODERN_BLUR_CLIENT: Condition = viewer(ViewerPredicate::ClientHasModernBlur);
-const LEGACY_INTERSTITIAL_CLIENT: Condition =
-    Condition::Not(Predicate::Viewer(ViewerPredicate::ClientHasModernBlur));
+const LEGACY_INTERSTITIAL_CLIENT: Condition = not(viewer(ViewerPredicate::ClientHasModernBlur));
 const GORE_BLUR_IGNORES_SETTINGS_CLIENT: Condition =
     viewer(ViewerPredicate::ClientBlursGoreIgnoringSettings);
 
@@ -611,12 +615,24 @@ pub(super) fn fosnr_level_1_non_follower_drop() -> Vec<RuleClause> {
         except_author(
             [
                 label(FOSNR_LEVEL_1),
-                Condition::Not(Predicate::Relationship(
-                    RelationshipPredicate::ViewerFollowsAuthor,
-                )),
+                not(relationship(RelationshipPredicate::ViewerFollowsAuthor)),
                 viewer(ViewerPredicate::ClientHasFosnrRules),
             ],
             drop_post(FilteredReason::PossiblyUndesirable),
+        ),
+    )
+}
+
+pub(super) fn fosnr_level_1_follower_soft_intervention() -> Vec<RuleClause> {
+    rule(
+        RuleId::FosnrAbuseInsultsFollower,
+        except_author(
+            [
+                label(FOSNR_LEVEL_1),
+                relationship(RelationshipPredicate::ViewerFollowsAuthor),
+                viewer(ViewerPredicate::ClientHasFosnrRules),
+            ],
+            soft_intervention(FOSNR_LEVEL_1, AppealablePolicy::ABUSE, 1),
         ),
     )
 }
@@ -668,7 +684,12 @@ pub(super) fn trusted_friends_tweet_drop() -> Vec<RuleClause> {
     rule(
         RuleId::TrustedFriendsTweet,
         except_author(
-            [tweet(TweetPredicate::IsTrustedFriendsTweet)],
+            [
+                tweet(TweetPredicate::IsTrustedFriendsTweet),
+                not(relationship(
+                    RelationshipPredicate::ViewerIsTrustedFriendsListMemberOrOwner,
+                )),
+            ],
             drop_post(FilteredReason::UnspecifiedReason),
         ),
     )
@@ -713,7 +734,7 @@ fn limit_replies_conversation_rules() -> Vec<RuleClause> {
         ViewerIsFollowedByConversationRootAuthor, ViewerIsInAllowedCountry,
         ViewerIsInConversationRootAuthorNetwork, ViewerSuperFollowsConversationRootAuthor,
     };
-    let unless = |leaf| [Condition::Not(Predicate::Relationship(leaf))];
+    let unless = |leaf| [not(relationship(leaf))];
     [
         limit_replies(RuleId::LimitRepliesByInvitation, ByInvitation, []),
         limit_replies(
@@ -729,9 +750,7 @@ fn limit_replies_conversation_rules() -> Vec<RuleClause> {
         limit_replies(
             RuleId::LimitRepliesVerified,
             Verified,
-            [Condition::Not(Predicate::Viewer(
-                ViewerPredicate::HasVerifiedBadge,
-            ))],
+            [not(viewer(ViewerPredicate::HasVerifiedBadge))],
         ),
         limit_replies(
             RuleId::LimitRepliesMyNetwork,
@@ -869,7 +888,7 @@ pub(super) fn nullcast_drop() -> Vec<RuleClause> {
             [
                 tweet(TweetPredicate::IsNullcast),
                 NOT_RETWEET,
-                Condition::Not(Predicate::Tweet(TweetPredicate::IsCommunityTweet)),
+                not(tweet(TweetPredicate::IsCommunityTweet)),
             ],
             drop_post(FilteredReason::TweetIsNullcast),
         ),
@@ -920,6 +939,19 @@ pub(super) fn takedown_drops() -> Vec<RuleClause> {
     .concat()
 }
 
+pub(super) fn article_tweet_content_drop() -> Vec<RuleClause> {
+    rule(
+        RuleId::ArticleTweetContent,
+        everyone(
+            [
+                tweet(TweetPredicate::HasArticle),
+                not(tweet(TweetPredicate::ArticleIsPublished)),
+            ],
+            drop_post(FilteredReason::UnspecifiedReason),
+        ),
+    )
+}
+
 pub(super) fn filter_all() -> Vec<RuleClause> {
     rule(
         RuleId::FilterAll,
@@ -948,6 +980,54 @@ pub(super) fn recs_media_drops() -> Vec<RuleClause> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_moderated_community_drops_exempt_the_author_and_the_community_moderators() {
+        use crate::models::{CommunityModeration, Decided, TweetFeatures, Verdict};
+        use crate::rules::fixtures::{author_viewer, candidate, viewer};
+        use crate::rules::{RuleEngine, SafetyLevel};
+        use std::num::NonZeroU64;
+        let engine = RuleEngine::for_tests();
+        for (moderation, rule) in [
+            (
+                CommunityModeration {
+                    is_hidden: true,
+                    is_author_removed: false,
+                },
+                "hidden_community_tweet/drop/unspecified",
+            ),
+            (
+                CommunityModeration {
+                    is_hidden: false,
+                    is_author_removed: true,
+                },
+                "author_removed_community_tweet/drop/unspecified",
+            ),
+        ] {
+            for (viewer, is_moderator, drops) in [
+                (viewer(1), Some(false), true),
+                (viewer(1), Some(true), false),
+                (author_viewer(), Some(false), false),
+            ] {
+                let mut post = candidate()
+                    .with_tweet_features(TweetFeatures {
+                        community_id: NonZeroU64::new(500),
+                        ..Default::default()
+                    })
+                    .build();
+                post.community_moderation = moderation;
+                post.viewer_is_community_moderator = is_moderator;
+                let verdict = engine
+                    .evaluate(SafetyLevel::TimelineHomeHydration, &viewer, &post)
+                    .into_verdict();
+                assert_eq!(
+                    matches!(verdict, Verdict::Withheld(Decided { by, .. }) if by == rule),
+                    drops,
+                    "{rule}, moderator {is_moderator:?}: {verdict:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn home_hydration_label_blurs_add_the_modern_blur_gate_to_the_timeline_home_conditions() {

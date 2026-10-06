@@ -298,7 +298,7 @@ class _RowShuffleBuffer:
         self._batches.append(batch)
         self._rows += batch.num_rows
         if self._rows >= self._capacity:
-            yield from self._emit(keep=self._capacity // 2)
+            yield from self._emit(keep=0)
 
     def flush(self) -> Iterator[pa.RecordBatch]:
         if self._rows > 0:
@@ -336,7 +336,7 @@ class _Rebatcher:
         self._pending = [rest] if rest.num_rows else []
         self._rows = rest.num_rows
         for i in range(0, n_full, self._batch_size):
-            yield merged.slice(i, self._batch_size)
+            yield pa.concat_batches([merged.slice(i, self._batch_size)])
 
     def flush(self) -> Iterator[pa.RecordBatch]:
         if self._rows > 0:

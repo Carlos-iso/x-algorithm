@@ -86,6 +86,7 @@ pub(crate) struct Recording {
     pub(crate) edges: BTreeMap<String, Answer<bool>>,
     pub(crate) viewer_countries: BTreeMap<u64, Answer<String>>,
     pub(crate) second_degree: BTreeMap<u64, Answer<bool>>,
+    pub(crate) trusted_friends: BTreeMap<u64, Answer<bool>>,
 }
 
 impl Recording {
@@ -112,6 +113,7 @@ impl Recording {
             edges,
             viewer_countries,
             second_degree,
+            trusted_friends,
         } = self;
         [
             named("pure_cores", pure_cores),
@@ -128,6 +130,7 @@ impl Recording {
             ),
             named("viewer_countries", viewer_countries),
             named("second_degree", second_degree),
+            named("trusted_friends", trusted_friends),
         ]
         .concat()
     }
@@ -160,6 +163,7 @@ impl Recording {
             edges,
             viewer_countries,
             second_degree,
+            trusted_friends: _,
         } = self;
         let authors = answered(pure_cores)
             .flat_map(|core| {
@@ -225,6 +229,7 @@ impl Recording {
             edges: _,
             viewer_countries: _,
             second_degree: _,
+            trusted_friends: _,
         } = self;
         let linked = answered(pure_cores)
             .flat_map(|core| {
@@ -405,6 +410,15 @@ impl Observer for Arc<Recorder> {
                 .insert(root, Answer::landed(batch.hydrated(&root)));
         }
     }
+
+    fn trusted_friends(&self, list_ids: &[u64], batch: &RawHydrationBatch<bool>) {
+        let mut recording = self.lock();
+        for &list in list_ids {
+            recording
+                .trusted_friends
+                .insert(list, Answer::landed(batch.hydrated(&list)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -533,6 +547,17 @@ mod replay {
                     }
                     Answer::Failed | Answer::Partial(_) => unkept("second_degree", root),
                 });
+            let sources = self
+                .trusted_friends
+                .iter()
+                .fold(sources, |sources, (&list, answer)| match answer {
+                    Answer::Found(true) => sources.trusted_friend(list, viewer_id),
+                    Answer::Found(false) => sources,
+                    Answer::NotFound => {
+                        panic!("trusted_friends/{list}: InMemorySources cannot answer not found")
+                    }
+                    Answer::Failed | Answer::Partial(_) => unkept("trusted_friends", list),
+                });
             self.edges.iter().fold(sources, |sources, (key, answer)| {
                 let (graph, direction, destination) = parse_edge_key(key);
                 match (answer, direction) {
@@ -598,6 +623,19 @@ mod replay {
                     Source::Wingman => {
                         absent("second_degree", &self.second_degree, sources.keys(source))
                     }
+                    Source::CommunityModeration
+                    | Source::CommunityModerator
+                    | Source::ArticleLifecycle => sources
+                        .keys(source)
+                        .into_iter()
+                        .flatten()
+                        .map(|key| format!("{source:?}/{key}"))
+                        .collect(),
+                    Source::TrustedFriends => absent(
+                        "trusted_friends",
+                        &self.trusted_friends,
+                        sources.keys(source),
+                    ),
                 })
                 .collect();
             misses.sort();
@@ -655,6 +693,7 @@ mod tests {
     async fn what_the_recorder_observes_replays_as_observed() {
         const VIEWER: u64 = 50;
         let paths = [(20, true), (21, false)];
+        let lists = [(7, true), (8, false)];
         let edges = [
             (EdgeDirection::Forward, 30, Hydrated::Found(true), true),
             (EdgeDirection::Forward, 31, Hydrated::Found(false), false),
@@ -684,6 +723,13 @@ mod tests {
             &HydrationBatch::from_results(
                 paths.map(|(root, _)| root),
                 HashMap::from(paths.map(|(root, path)| (root, Ok::<_, ()>(Some(path))))),
+            ),
+        );
+        recorder.trusted_friends(
+            &lists.map(|(list, _)| list),
+            &HydrationBatch::from_results(
+                lists.map(|(list, _)| list),
+                HashMap::from(lists.map(|(list, holds)| (list, Ok::<_, ()>(Some(holds))))),
             ),
         );
         for (direction, destination, answer, _) in &edges {
@@ -724,6 +770,16 @@ mod tests {
                 sources.second_degree(VIEWER, &[root]).await.hydrated(&root),
                 Some(&Hydrated::Found(path)),
                 "second_degree/{root}"
+            );
+        }
+        for (list, holds) in lists {
+            assert_eq!(
+                sources
+                    .trusted_friends(VIEWER, &[list])
+                    .await
+                    .hydrated(&list),
+                Some(&Hydrated::Found(holds)),
+                "trusted_friends/{list}"
             );
         }
         for (direction, destination, _, holds) in edges {

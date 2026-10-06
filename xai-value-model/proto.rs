@@ -30,6 +30,8 @@ impl From<&pb::PhoenixScores> for PhoenixScores {
             post_unexplored_score: s.post_unexplored_score,
             dwell_time: s.dwell_time,
             click_dwell_time: s.click_dwell_time,
+            home_video_continuation_secs: s.home_video_continuation_secs,
+            home_profile_visit_secs: s.home_profile_visit_secs,
         }
     }
 }
@@ -62,7 +64,8 @@ impl From<&PhoenixScores> for pb::PhoenixScores {
             post_unexplored_score: s.post_unexplored_score,
             dwell_time: s.dwell_time,
             click_dwell_time: s.click_dwell_time,
-            active_secs_5m_residual_norm: None,
+            home_video_continuation_secs: s.home_video_continuation_secs,
+            home_profile_visit_secs: s.home_profile_visit_secs,
         }
     }
 }
@@ -87,6 +90,7 @@ impl CandidateScoringInputs {
             cold_start_lift_to_rank: c.cold_start_lift_to_rank,
             weighted_score: c.weighted_score,
             author_exploration_bonus: 0.0,
+            user_video_continuation_secs: None,
         }
     }
 }

@@ -2,9 +2,9 @@ use super::{
     ENV_IMAGE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
 };
 use crate::config::ENV_REFERENCE;
-use crate::filter::{EvaluationStatus, FilterOutcome, FilterRequest, FilterTweets};
+use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
 use crate::hydration::{HYDRATION_TIMEOUT, request_context};
-use crate::models::{RawCandidate, TweetId, Verdict};
+use crate::models::{Evaluation, RawCandidate, TweetId, Verdict};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
 use crate::retweet;
 use crate::rules::SafetyLevel;
@@ -333,17 +333,18 @@ impl TweetypieReference {
         let Some(viewer_id) = viewer_id else {
             return;
         };
-        if !matches!(
-            safety_level,
-            SafetyLevel::TimelineHome | SafetyLevel::TimelineHomeRecommendations
-        ) {
-            return;
+        match safety_level {
+            SafetyLevel::TimelineHome | SafetyLevel::TimelineHomeRecommendations => {}
+            SafetyLevel::FilterAll
+            | SafetyLevel::TimelineHomeHydration
+            | SafetyLevel::ImmersiveExpandedRecommendations => return,
         }
         let tweet_ids: Vec<TweetId> = outcomes
             .iter()
-            .filter(|outcome| {
-                outcome.status == EvaluationStatus::Evaluated
-                    && !matches!(outcome.verdict, Verdict::Withheld(_))
+            .filter(|outcome| match &outcome.evaluation {
+                Evaluation::Complete { verdict } => !matches!(verdict, Verdict::Withheld(_)),
+                Evaluation::NotFound(_) => true,
+                Evaluation::Partial { .. } | Evaluation::Failed(_) => false,
             })
             .map(|outcome| outcome.tweet_id)
             .collect();
@@ -513,7 +514,7 @@ impl Compared<'_> {
         };
         let vf_rule = self
             .vf
-            .and_then(|outcome| treatment::decided_rows(&outcome.verdict).next())
+            .and_then(|outcome| treatment::decided_rows(outcome.evaluation.verdict()).next())
             .map_or(NONE, |(rule, _)| rule);
         Bucket { tp, vf, vf_rule }
     }
@@ -522,7 +523,7 @@ impl Compared<'_> {
         let vf_rules: Vec<String> = self
             .vf
             .into_iter()
-            .flat_map(|outcome| treatment::decided_rows(&outcome.verdict))
+            .flat_map(|outcome| treatment::decided_rows(outcome.evaluation.verdict()))
             .map(|(rule, kind)| format!("{rule}:{kind}"))
             .collect();
         let labels: BTreeMap<i32, Option<i64>> = self
@@ -545,7 +546,7 @@ impl Compared<'_> {
             "tp_result": self.tp.result,
             "tp_strato_error": self.tp.strato_error,
             "vf": [&bucket.vf.0, &bucket.vf.1],
-            "vf_status": self.vf.map(|outcome| format!("{:?}", outcome.status)),
+            "vf_status": self.vf.map(|outcome| vf_status(&outcome.evaluation)),
             "vf_rules": vf_rules,
             "labels": labels,
         })
@@ -573,15 +574,25 @@ fn tp_result(result: StratoResult<GetTweetFieldsResult>) -> TpResult {
     }
 }
 
-pub(crate) fn vf_label(outcome: &FilterOutcome) -> Label {
-    if outcome.status != EvaluationStatus::Evaluated {
-        return label(Class::Failed, NONE);
+fn vf_status(evaluation: &Evaluation) -> &'static str {
+    match evaluation {
+        Evaluation::Complete { .. } => "Evaluated",
+        Evaluation::Partial { .. } => "Failed",
+        Evaluation::NotFound(_) => "NotFound",
+        Evaluation::Failed(_) => "LookupFailed",
     }
-    tp_label(&treatment::thrift_result_state(
-        &outcome.verdict,
-        SAFETY_LEVEL,
-        &LimitedActionsPolicies::default(),
-    ))
+}
+
+pub(crate) fn vf_label(outcome: &FilterOutcome) -> Label {
+    match &outcome.evaluation {
+        Evaluation::Complete { verdict } => tp_label(&treatment::thrift_result_state(
+            verdict,
+            SAFETY_LEVEL,
+            &LimitedActionsPolicies::default(),
+        )),
+        Evaluation::NotFound(_) => label(Class::NotFound, NONE),
+        Evaluation::Partial { .. } | Evaluation::Failed(_) => label(Class::Failed, NONE),
+    }
 }
 
 fn tp_label(state: &TweetFieldsResultState) -> Label {
@@ -637,7 +648,7 @@ fn tp_label(state: &TweetFieldsResultState) -> Label {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::Hydrators;
+    use crate::hydration::{Hydrators, Lookup};
     use crate::models::{Decided, DropReason, Withholding};
     use crate::rules::fixtures::CLIENT_CLASSES;
     use std::fs;
@@ -660,15 +671,14 @@ mod tests {
         FilterOutcome {
             tweet_id: TweetId(1),
             source_tweet_id: None,
-            verdict,
-            rested_on: Hydrators::empty(),
-            status: EvaluationStatus::Evaluated,
+            evaluation: Evaluation::Complete { verdict },
             safety_labels: None,
         }
     }
 
     fn shown() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         }
@@ -686,6 +696,25 @@ mod tests {
             tp,
             vf,
         }
+    }
+
+    #[test]
+    fn the_record_names_each_evaluation() {
+        assert_eq!(
+            [
+                Evaluation::Complete { verdict: shown() },
+                Evaluation::Partial {
+                    verdict: shown(),
+                    fail_open_defaults: Hydrators::empty(),
+                },
+                Evaluation::NotFound(Lookup::Tweet),
+                Evaluation::Failed(Lookup::Author),
+            ]
+            .iter()
+            .map(vf_status)
+            .collect::<Vec<_>>(),
+            ["Evaluated", "Failed", "NotFound", "LookupFailed"]
+        );
     }
 
     #[test]
@@ -765,6 +794,24 @@ mod tests {
         assert_eq!(
             (bucket.vf, bucket.vf_rule),
             (pair("drop", "author_is_suspended"), "suspended_author/drop")
+        );
+        let not_found = TpResult {
+            label: pair("not_found", NONE),
+            result: None,
+            strato_error: None,
+        };
+        let deleted = FilterOutcome {
+            evaluation: Evaluation::NotFound(Lookup::Tweet),
+            ..shown
+        };
+        let bucket = compared(&not_found, Some(&deleted)).bucket();
+        assert_eq!(
+            (bucket.tp, bucket.vf, bucket.vf_rule),
+            (
+                pair("not_found", NONE),
+                pair("not_found", NONE),
+                "not_found"
+            )
         );
     }
 

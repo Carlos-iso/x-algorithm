@@ -115,7 +115,7 @@ pub(crate) async fn evaluate(
         .map(|outcome| Evaluated {
             tweet_id: outcome.tweet_id.0,
             label: vf_label(outcome),
-            rule: treatment::decided_rows(&outcome.verdict)
+            rule: treatment::decided_rows(outcome.evaluation.verdict())
                 .next()
                 .map(|(rule, _)| rule),
         })

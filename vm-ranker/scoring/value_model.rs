@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::warn;
 use xai_feature_switches::{AuthorRulesEvaluator, Params};
 use xai_value_model::{
-    compute_value_scores, CandidateScoringInputs, PhoenixScores, QueryScoringContext,
-    ValueModelWeights, ValueScores,
+    compute_value_scores, set_user_video_continuation, CandidateScoringInputs, PhoenixScores,
+    QueryScoringContext, ValueModelWeights, ValueScores,
 };
 use xai_vm_ranker_proto::RankRequest;
 
@@ -85,6 +85,7 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         quoted_vqv: params.get(QuotedVqvWeight),
         follow_author: params.get(FollowAuthorWeight),
         post_unexplored: params.get(PostUnexploredWeight),
+        post_unexplored_include_out_of_network: params.get(PostUnexploredIncludeOutOfNetwork),
         not_interested: params.get(NotInterestedWeight),
         block_author: params.get(BlockAuthorWeight),
         mute_author: params.get(MuteAuthorWeight),
@@ -92,6 +93,9 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         not_dwelled: params.get(NotDwelledWeight),
         cont_dwell_time: params.get(ContDwellTimeWeight),
         cont_click_dwell_time: params.get(ContClickDwellTimeWeight),
+        video_continuation: params.get(VideoContinuationWeight),
+        user_video_continuation: params.get(UserVideoContinuationWeight),
+        profile_visit_secs: params.get(ProfileVisitSecsWeight),
         min_video_duration_ms: params.get(MinVideoDurationMs),
         enable_quoted_vqv_duration_check: params.get(EnableQuotedVqvDurationCheck),
         bidirectional_follow_reply_weight_boost: params.get(BidirectionalFollowReplyWeightBoost),
@@ -155,6 +159,9 @@ fn compute_or_fallback(
     let weights = weights_from_params(params, req.viewer_id);
     let ctx = scoring_context(req, params);
     let mut inputs = candidate_inputs(req, &weights);
+    if weights.user_video_continuation != 0.0 {
+        set_user_video_continuation(&mut inputs);
+    }
     if let Some(author_rules) = author_rules {
         set_author_exploration_bonuses(author_rules, &mut inputs);
     }
@@ -196,7 +203,7 @@ fn set_author_exploration_bonuses(
         .inc_by(inputs.len() as u64 - with_bonus);
 }
 
-fn head_predictions(s: &PhoenixScores) -> [(&'static str, Option<f64>); 25] {
+fn head_predictions(s: &PhoenixScores) -> [(&'static str, Option<f64>); 27] {
     [
         ("favorite", s.favorite_score),
         ("reply", s.reply_score),
@@ -216,6 +223,11 @@ fn head_predictions(s: &PhoenixScores) -> [(&'static str, Option<f64>); 25] {
         ("quoted_vqv", s.quoted_vqv_score),
         ("dwell_time", s.dwell_time),
         ("click_dwell_time", s.click_dwell_time),
+        (
+            "home_video_continuation_secs",
+            s.home_video_continuation_secs,
+        ),
+        ("home_profile_visit_secs", s.home_profile_visit_secs),
         ("follow_author", s.follow_author_score),
         ("not_interested", s.not_interested_score),
         ("block_author", s.block_author_score),
@@ -228,7 +240,7 @@ fn head_predictions(s: &PhoenixScores) -> [(&'static str, Option<f64>); 25] {
 
 fn record_score_metrics(inputs: &[CandidateScoringInputs], raw: &ValueScores) {
     let mut candidates = 0;
-    let mut prediction = [0.0; 25];
+    let mut prediction = [0.0; 27];
     for c in inputs.iter().filter(|c| c.weighted_score.is_none()) {
         candidates += 1;
         for (i, (_, score)) in head_predictions(&c.phoenix_scores).into_iter().enumerate() {

@@ -7,6 +7,7 @@ mod golden_corpus;
 pub mod metrics;
 pub mod registry;
 mod rule_spec;
+mod safety_level;
 mod tweet_rules;
 
 #[cfg(test)]
@@ -14,9 +15,10 @@ use crate::models::{HydratedTweetCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
 use context::RuleContext;
-pub use registry::{RuleEngine, SafetyLevel};
+pub use registry::RuleEngine;
 #[cfg(test)]
 use rule_spec::Predicate;
+pub use safety_level::SafetyLevel;
 
 #[cfg(test)]
 pub(crate) fn test_context<'a>(

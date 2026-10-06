@@ -52,15 +52,10 @@ impl FilterTweetsEndpoint {
         let viewer_id = normalize_viewer_id(req.viewer_id);
         ft_metrics::record_viewer_state(req.viewer_id, viewer_id);
 
-        let safety_level = match req.safety_level() {
-            vf_pb::SafetyLevel::FilterAll => SafetyLevel::FilterAll,
-            vf_pb::SafetyLevel::TimelineHome => SafetyLevel::TimelineHome,
-            vf_pb::SafetyLevel::TimelineHomeRecommendations => {
-                SafetyLevel::TimelineHomeRecommendations
-            }
-            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations => {
-                SafetyLevel::ImmersiveExpandedRecommendations
-            }
+        let Some(safety_level) = SafetyLevel::from_proto(req.safety_level()) else {
+            request_metrics.mark_failure();
+            caller.mark_failure();
+            return Err(Status::unimplemented("safety level has no Rust policy"));
         };
         let candidates: Vec<RawCandidate> = req
             .tweets
@@ -93,12 +88,23 @@ impl FilterTweetsEndpoint {
         ft_metrics::record_verdicts(
             Rpc::FilterTweets,
             safety_level,
-            response.outcomes.iter().map(|outcome| &outcome.verdict),
+            response
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.evaluation.verdict()),
         );
-        ft_metrics::record_rested_on(
+        ft_metrics::record_unresolved(
             Rpc::FilterTweets,
             safety_level,
-            response.outcomes.iter().map(|outcome| outcome.rested_on),
+            response.outcomes.iter().map(|outcome| &outcome.evaluation),
+        );
+        ft_metrics::record_fail_open_defaults(
+            Rpc::FilterTweets,
+            safety_level,
+            response
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.evaluation.fail_open_defaults()),
         );
 
         if let Some(finish_comparison) = finish_comparison {
@@ -142,7 +148,7 @@ pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
 }
 
 fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult {
-    let (action, filtered_reason) = treatment::proto_action(outcome.verdict);
+    let (action, filtered_reason) = treatment::proto_action(outcome.evaluation.into_verdict());
     vf_pb::TweetVisibilityResult {
         tweet_id: outcome.tweet_id.0,
         action: Some(action),
