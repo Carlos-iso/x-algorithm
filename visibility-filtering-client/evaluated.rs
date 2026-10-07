@@ -31,13 +31,14 @@ impl EvaluationResult {
         self,
         fetched: TweetFieldsResultState,
     ) -> Option<TweetFieldsResultState> {
-        match (self, fetched) {
-            (
-                _,
-                fetched @ (TweetFieldsResultState::NotFound(_) | TweetFieldsResultState::Failed(_)),
-            ) => Some(fetched),
-            (Self::Evaluated(state), _) => Some(*state),
-            (Self::NotEvaluated | Self::Failed, _) => None,
+        match fetched {
+            TweetFieldsResultState::Found(_) => match self {
+                Self::Evaluated(state) => Some(*state),
+                Self::NotEvaluated | Self::Failed => None,
+            },
+            kept @ (TweetFieldsResultState::Filtered(_)
+            | TweetFieldsResultState::NotFound(_)
+            | TweetFieldsResultState::Failed(_)) => Some(kept),
         }
     }
 }
@@ -160,43 +161,6 @@ mod tests {
             vec![0; MAX_RESULT_STATE_BYTES + 1],
         ] {
             assert!(decode_result_state(&bytes).is_err(), "accepted {bytes:?}");
-        }
-    }
-
-    #[test]
-    fn vf_state_replaces_tweetypie_found_but_not_missing_tweets() {
-        let found = || TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
-        let missing =
-            TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));
-        let tweetypie_failed =
-            TweetFieldsResultState::Failed(TweetFieldsResultFailed::new(true, None));
-        let bounced = || filtered(FilteredReason::TweetIsBounced(true));
-        let cases = [
-            (
-                EvaluationResult::Evaluated(Box::new(bounced())),
-                found(),
-                Some(bounced()),
-            ),
-            (
-                EvaluationResult::Evaluated(Box::new(bounced())),
-                missing.clone(),
-                Some(missing.clone()),
-            ),
-            (
-                EvaluationResult::NotEvaluated,
-                missing.clone(),
-                Some(missing),
-            ),
-            (
-                EvaluationResult::Evaluated(Box::new(bounced())),
-                tweetypie_failed.clone(),
-                Some(tweetypie_failed),
-            ),
-            (EvaluationResult::NotEvaluated, found(), None),
-            (EvaluationResult::Failed, found(), None),
-        ];
-        for (evaluation, fetched, expected) in cases {
-            assert_eq!(evaluation.into_result_state(fetched), expected);
         }
     }
 }

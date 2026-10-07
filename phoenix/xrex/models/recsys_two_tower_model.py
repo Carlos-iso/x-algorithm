@@ -666,7 +666,7 @@ def compute_retrieval_loss(
 
     if logq_correction_scale > 0.0:
         tweet_counts = get_candidate_tweet_counts(
-            batch["candidate_seq"]["post_hashes"],
+            cast_jax(batch["candidate_seq"]["post_hashes"]),
             log_q_num_bins=100_000_000,
             negative_sample_mask=jnp.ones((B, L), dtype=jnp.bool_),
         )

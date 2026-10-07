@@ -30,7 +30,7 @@ from xrex.models.recsys_attention import (
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
 from xrex.utils.model import MemoryModelOutput
-from xrex.utils.sharding import maybe_shard_map, with_sharding_constraint
+from xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual
 
 
 class RotaryEmbedding(hk.Module):
@@ -207,8 +207,8 @@ class MultiHeadAttention(hk.Module):
             qkv = jnp.reshape(qkv, (qkv.shape[0], qkv.shape[1], num_kv_heads, -1, qkv.shape[-1]))
 
             out_specs = (qkv_pspec,) * 3
-            query_heads, key_heads, value_heads = maybe_shard_map(
-                slicing, mesh, qkv_pspec, out_specs, check_vma=False
+            query_heads, key_heads, value_heads = shard_map_unless_manual(
+                slicing, out_specs=out_specs, in_specs=qkv_pspec, mesh=mesh
             )(qkv)
 
         else:
@@ -244,9 +244,9 @@ class MultiHeadAttention(hk.Module):
                 lr_multiplier=lr_multiplier,
             )
 
-            query_heads = with_sharding_constraint(query_heads, qkv_pspec)
-            key_heads = with_sharding_constraint(key_heads, qkv_pspec)
-            value_heads = with_sharding_constraint(value_heads, qkv_pspec)
+            query_heads = with_sharding_constraint_unless_manual(query_heads, qkv_pspec)
+            key_heads = with_sharding_constraint_unless_manual(key_heads, qkv_pspec)
+            value_heads = with_sharding_constraint_unless_manual(value_heads, qkv_pspec)
 
         query_heads = checkpoint_name(query_heads, "query_heads")
         key_heads = checkpoint_name(key_heads, "key_heads")
@@ -261,9 +261,11 @@ class MultiHeadAttention(hk.Module):
             namespace=self.config.attn_sharding_namespace,
         )
 
-        query_heads = with_sharding_constraint(query_heads, activation_with_qheads_pspec)
+        query_heads = with_sharding_constraint_unless_manual(
+            query_heads, activation_with_qheads_pspec
+        )
         key_heads, value_heads = (
-            with_sharding_constraint(x, activation_with_kvheads_pspec)
+            with_sharding_constraint_unless_manual(x, activation_with_kvheads_pspec)
             for x in (key_heads, value_heads)
         )
 
@@ -324,7 +326,7 @@ class MultiHeadAttention(hk.Module):
         attn = jnp.reshape(attn, (*leading_dims, -1))
         attn_output = attn
 
-        attn = with_sharding_constraint(
+        attn = with_sharding_constraint_unless_manual(
             attn,
             self.sharding_context.sharding_specs(
                 NamedShape(attn.shape, names=("batch_attn", "sequence", "kv_head")),

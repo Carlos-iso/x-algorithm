@@ -3,7 +3,6 @@
 import collections
 import concurrent.futures
 import enum
-import functools
 import gc
 import itertools
 import json
@@ -17,7 +16,7 @@ import sys
 import time
 import typing
 from dataclasses import dataclass, field, replace
-from typing import Iterator, NamedTuple
+from typing import Iterator, NamedTuple, Sequence
 
 import grpc
 import haiku as hk
@@ -75,7 +74,11 @@ from xrex.models.recsys_embedding import (
     RecsysEmbeddingsParameter,
     get_recsys_embed_param_to_jax_array,
 )
-from xrex.models.recsys_model import RecsysAggregatedModelConfig
+from xrex.models.recsys_model import (
+    CandidateInputs,
+    RecsysAggregatedModel,
+    RecsysAggregatedModelConfig,
+)
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.optimizers.optim import InjectHyperparamsState, apply_updates
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
@@ -122,15 +125,6 @@ class BatchPipelineState:
     exhausted: bool = False
 
 
-def _group_microbatches(
-    batches: Iterator[tuple[RecsysFeaturesBatch, dict[int, int] | None]], num_microbatch: int
-) -> Iterator[tuple[tuple[RecsysFeaturesBatch, ...], dict[int, int] | None]]:
-    for group in itertools.batched(batches, num_microbatch, strict=False):
-        if len(group) < num_microbatch:
-            return
-        yield tuple(batch for batch, _ in group), group[-1][1]
-
-
 class IncrementalState(NamedTuple):
     unique_tokens: npt.NDArray[np.int32]
     token_count: int
@@ -168,6 +162,14 @@ def pbroadcast(x, axis_name, source):
     axis_name = tuple(axis_name) if not isinstance(axis_name, tuple) else axis_name
     masked = jnp.where(jax.lax.axis_index(axis_name) == source, x, jnp.zeros_like(x))
     return jax.lax.psum(masked, axis_name)
+
+
+def _num_users(data: RecsysFeaturesBatch) -> int:
+    return math.prod(data["user_hashes"].shape[:-1])
+
+
+def _step_token_ids(token_ids: Sequence[jax.Array], data_axis) -> jax.Array:
+    return jax.lax.with_sharding_constraint(jnp.stack(token_ids), P(None, data_axis, None))
 
 
 def _pad_vocab_for_ep(emb: jax.Array, ep: int, name: str = "emb_table") -> jax.Array:
@@ -598,7 +600,7 @@ class RecsysTrainer(Trainer):
 
         hash_leaves = self._get_embedding_hash_leaves(data)
 
-        users = self._num_users(data)
+        users = _num_users(data)
         flat_hashes = [x.reshape(users, -1) for x in hash_leaves]
         all_hashes = jax.lax.with_sharding_constraint(
             jnp.concatenate(flat_hashes, axis=1), P(data_axis)
@@ -616,7 +618,7 @@ class RecsysTrainer(Trainer):
         cfg = self.model_config
         has_emb_flags = isinstance(cfg, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
         hash_leaves = self._get_embedding_hash_leaves(data)
-        lengths = [x.reshape(self._num_users(data), -1).shape[1] for x in hash_leaves]
+        lengths = [x.reshape(_num_users(data), -1).shape[1] for x in hash_leaves]
         splits = jnp.split(table.x, np.cumsum(lengths[:-1]), axis=-2)
 
         if self.using_seqpack:
@@ -707,8 +709,11 @@ class RecsysTrainer(Trainer):
             batch = self._maybe_inject_global_neg_embeddings(batch)
 
             if history_user_drop_rate > 0.0:
-                self._last_history_user_dropout_bsz = batch["user_hashes"].shape[0]
-                self._last_history_user_dropout_count = self._apply_per_history_user_dropout(
+                if i % self.num_microbatch == 0:
+                    self._last_history_user_dropout_bsz = 0
+                    self._last_history_user_dropout_count = 0
+                self._last_history_user_dropout_bsz += batch["user_hashes"].shape[0]
+                self._last_history_user_dropout_count += self._apply_per_history_user_dropout(
                     batch, history_user_drop_rate
                 )
 
@@ -755,7 +760,11 @@ class RecsysTrainer(Trainer):
         if prepare_data:
             it = self.dataset_with_prepare(dataset)
             if self.use_async_emb:
-                it = _group_microbatches(it, self.num_microbatch)
+                it = (
+                    (tuple(batch for batch, _ in group), group[-1][1])
+                    for group in itertools.batched(it, self.num_microbatch, strict=False)
+                    if len(group) == self.num_microbatch
+                )
         else:
             it = self.dataset_without_prepare(dataset)
         future = self.dataloading_thread.submit(next, it, stop)
@@ -1053,20 +1062,9 @@ class RecsysTrainer(Trainer):
         segments.append(data["candidate_seq"]["auth_hashes"])
         if use_ip:
             segments.append(data["user_ip_hashes"])
-        users = self._num_users(data)
+        users = _num_users(data)
         ids = jnp.concatenate([x.reshape(users, -1) for x in segments], axis=1)
         return self._row_embedding_token_ids(ids) if self.use_row_emb else ids
-
-    @staticmethod
-    def _num_users(data: RecsysFeaturesBatch) -> int:
-        return math.prod(data["user_hashes"].shape[:-1])
-
-    def _step_token_ids(self, data: tuple[RecsysFeaturesBatch, ...]) -> jax.Array:
-        assert self._async_emb_context is not None
-        return jax.lax.with_sharding_constraint(
-            jnp.stack([self.get_flattened_token_ids(batch) for batch in data]),
-            P(None, self._async_emb_context.data_axis, None),
-        )
 
     def _segment_sum(
         self,
@@ -1275,69 +1273,63 @@ class RecsysTrainer(Trainer):
         batches: RecsysFeaturesBatch,
         embeddings: RecsysEmbeddingsParameter,
         rngs: jax.Array,
-        logq_counts: jax.Array | None,
+        candidate_inputs: CandidateInputs,
         loss_normalizers: dict[str, jax.Array],
     ):
         ctx = self._async_emb_context
         assert ctx is not None
         rows = batches["user_hashes"].shape[1]
-        assert all(x.shape[1] == rows for x in jax.tree.leaves(batches)), "a leaf without rows"
+        leaves = jax.tree.leaves((batches, candidate_inputs))
+        assert all(x.shape[1] == rows for x in leaves), "a leaf without rows"
+        assert all(ctx.mesh.shape[a] == 1 for a in ctx.mesh.axis_names if a not in ctx.data_axis)
         rows_spec = P(None, ctx.data_axis)
-        xs = (batches, embeddings, rngs, logq_counts)
-        first = jax.tree.map(lambda x: x[0], (batches, embeddings, logq_counts))
-        _, (stats_shape, _) = jax.eval_shape(
-            functools.partial(
-                microbatch_loss_fn, logq_counts=first[2], loss_normalizers=loss_normalizers
-            ),
-            params,
-            rngs[0],
-            first[0],
-            first[1],
-        )
 
         @shard_map(
             mesh=ctx.mesh,
-            in_specs=(P(), (rows_spec, rows_spec, P(), rows_spec), P()),
-            out_specs=(P(), rows_spec, rows_spec),
+            in_specs=(P(), rows_spec, rows_spec, P(), rows_spec, P()),
+            out_specs=(P(), P(), P(), rows_spec, P(ctx.data_axis)),
             check_vma=False,
         )
-        def scan(params, xs, loss_normalizers):
-            def body(carry, x):
-                batch, embeddings, rng, logq_counts = x
-                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
-                (loss, (stats, metric_inputs)), (gradients, emb_gradients) = jax.value_and_grad(
-                    microbatch_loss_fn, argnums=(0, 3), has_aux=True
-                )(
+        def scan(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers):
+            def loss(params, rng, batch, embeddings, candidate_inputs):
+                return microbatch_loss_fn(
                     params,
                     rng,
                     batch,
                     embeddings,
-                    logq_counts=logq_counts,
+                    candidate_inputs=candidate_inputs,
                     loss_normalizers=loss_normalizers,
                 )
-                acc_gradients, acc_loss, acc_stats = carry
-                carry = (
-                    jax.tree.map(lambda a, g: a + g.astype(jnp.float32), acc_gradients, gradients),
-                    acc_loss + loss,
-                    jax.tree.map(jnp.add, acc_stats, stats),
+
+            def body(gradients, microbatch):
+                rng, batch, embeddings, candidate_inputs = microbatch
+                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
+                (loss_k, (stats, metric_inputs)), (gradients_k, emb_gradients) = jax.value_and_grad(
+                    loss, argnums=(0, 3), has_aux=True
+                )(params, rng, batch, embeddings, candidate_inputs)
+                gradients = jax.tree.map(
+                    lambda a, g: a + g.astype(jnp.float32), gradients, gradients_k
                 )
-                return carry, (emb_gradients, metric_inputs)
+                return gradients, (loss_k, stats, emb_gradients, metric_inputs)
 
-            init = (
+            gradients, (losses, stats, emb_gradients, metric_inputs) = jax.lax.scan(
+                body,
                 jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params),
-                jnp.zeros((), jnp.float32),
-                jax.tree.map(jnp.zeros_like, stats_shape),
+                (rngs, batches, embeddings, candidate_inputs),
             )
-            (gradients, loss, stats), (emb_gradients, metric_inputs) = jax.lax.scan(body, init, xs)
             gradients = jax.tree.map(lambda g, p: g.astype(p.dtype), gradients, params)
+            loss_sum, stats = jax.tree.map(lambda x: x.sum(0), (losses, stats))
+            joined = jax.tree.map(
+                lambda x: x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]),
+                (metric_inputs, batches),
+            )
             return (
-                jax.lax.psum((gradients, loss, stats), ctx.data_axis),
+                *jax.lax.psum((gradients, loss_sum, stats), ctx.data_axis),
                 emb_gradients,
-                metric_inputs,
+                joined,
             )
 
-        (gradients, loss, stats), emb_gradients, metric_inputs = scan(params, xs, loss_normalizers)
-        return gradients, loss, stats, emb_gradients, metric_inputs
+        return scan(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers)
 
     def async_emb_step(
         self,
@@ -1366,7 +1358,7 @@ class RecsysTrainer(Trainer):
             )
 
         emb_table = state.emb_table
-        token_ids = self._step_token_ids(data)
+        token_ids = _step_token_ids([self.get_flattened_token_ids(b) for b in data], ctx.data_axis)
         prefetched_embeddings = recsys_async_emb.lookup_done(
             ctx, prev_step_lookup_pin, token_ids.shape
         )
@@ -1384,15 +1376,17 @@ class RecsysTrainer(Trainer):
         gate = prefetched_embeddings[0, :, 0, :1]
 
         if self.num_microbatch > 1:
-            normalizers_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
+            loss_inputs_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
             data_shards = math.prod(self.mesh.shape[a] for a in ctx.data_axis)
-            loss_normalizers, logq_counts = normalizers_fn(
+            candidate_inputs, loss_normalizers = loss_inputs_fn(
                 {}, None, data, self.num_microbatch * data_shards
             )
             batches = jax.tree.map(lambda *x: jnp.stack(x), *data)
-            gate = gate + jnp.stack(jax.tree.leaves(loss_normalizers)).sum().astype(gate.dtype)
+            gate = recsys_async_emb.depend(
+                ctx, gate, jnp.stack(jax.tree.leaves(loss_normalizers)).sum(), on_sharded=False
+            )
             if segment_ids is not None:
-                gate = gate + recsys_async_emb.zero_pin(ctx, segment_ids[0])[0].astype(gate.dtype)
+                gate = recsys_async_emb.depend(ctx, gate, segment_ids[0])
 
         update_start_pin, updating_table, updating_emb_state, emb_optim_metrics = (
             self._emb_optim.gradient_update_start(
@@ -1412,6 +1406,9 @@ class RecsysTrainer(Trainer):
         embeddings, _ = self._emb_optim.transform_embeddings(
             embeddings, token_ids, state.emb_table_state
         )
+        next_step_token_ids = _step_token_ids(
+            [self.get_flattened_token_ids(b) for b in next_step_data], ctx.data_axis
+        ).astype(jnp.int32)
 
         if self.num_microbatch == 1:
             embeddings = jax.tree.map(lambda x: x[0], embeddings)
@@ -1420,7 +1417,9 @@ class RecsysTrainer(Trainer):
                 embeddings,
                 candidate_author_embeddings=replace(
                     candidate_authors,
-                    x=recsys_async_emb.depend(ctx, candidate_authors.x, update_start_pin),
+                    x=recsys_async_emb.depend(
+                        ctx, candidate_authors.x, update_start_pin, on_sharded=False
+                    ),
                 ),
             )
 
@@ -1442,9 +1441,7 @@ class RecsysTrainer(Trainer):
                 (updated_emb_state, grad_update_done_pin)
             )
 
-            next_step_token_ids, _ = jax.lax.optimization_barrier(
-                (self._step_token_ids(next_step_data).astype(jnp.int32), loss)
-            )
+            next_step_token_ids, _ = jax.lax.optimization_barrier((next_step_token_ids, loss))
             new_emb_table, next_step_lookup_pin = recsys_async_emb.lookup_start(
                 ctx, next_step_token_ids, updating_table, grad_update_done_pin
             )
@@ -1452,25 +1449,21 @@ class RecsysTrainer(Trainer):
                 (jnp.ones_like(loss), next_step_lookup_pin)
             )
             gradients, emb_gradients = loss_vjp(loss_cotangent)
-            if self.precision_level >= 2:
-                gradients = jax.tree.map(lambda x: x.astype(jnp.float32), gradients)
             emb_gradients = jax.tree.map(lambda x: x[None], emb_gradients)
         else:
             new_emb_table, next_step_lookup_pin = recsys_async_emb.lookup_start(
-                ctx,
-                self._step_token_ids(next_step_data).astype(jnp.int32),
-                updating_table,
-                update_start_pin,
+                ctx, next_step_token_ids, updating_table, update_start_pin
             )
-            lookup_zero = recsys_async_emb.zero_pin(ctx, next_step_lookup_pin)[0]
-            loss_normalizers = jax.tree.map(lambda n: n + lookup_zero, loss_normalizers)
-            gradients, loss, stats, emb_gradients, metric_inputs = self._microbatch_scan(
+            loss_normalizers = recsys_async_emb.depend(
+                ctx, loss_normalizers, next_step_lookup_pin, x_sharded=False
+            )
+            gradients, loss, stats, emb_gradients, (metric_inputs, batch) = self._microbatch_scan(
                 microbatch_loss_fn,
                 fprop_params,
                 batches,
                 embeddings,
                 jax.random.split(rng, self.num_microbatch),
-                logq_counts,
+                candidate_inputs,
                 loss_normalizers,
             )
             (
@@ -1483,13 +1476,11 @@ class RecsysTrainer(Trainer):
             updated_emb_state, grad_update_done_pin = jax.lax.optimization_barrier(
                 (updated_emb_state, grad_update_done_pin)
             )
-            if self.precision_level >= 2:
-                gradients = jax.tree.map(lambda x: x.astype(jnp.float32), gradients)
             stats = metrics_fn(
                 {},
                 None,
                 metric_inputs,
-                batches,
+                batch,
                 stats,
                 state.rce_ema,
                 rce_alpha,
@@ -1497,6 +1488,8 @@ class RecsysTrainer(Trainer):
                 state.calib_ema,
             )
         emb_valid_step = emb_valid_step | ~emb_update_pending
+        if self.precision_level >= 2:
+            gradients = jax.tree.map(lambda x: x.astype(jnp.float32), gradients)
 
         updates, new_opt_state = self.optim.update(gradients, state.opt_state, params=fprop_params)
         new_opt_state = typing.cast(InjectHyperparamsState, new_opt_state)
@@ -1547,7 +1540,7 @@ class RecsysTrainer(Trainer):
 
         stage_pin = recsys_async_emb.stage_update(
             self._async_emb_context,
-            self._flatten_emb_grads(emb_gradients, self._num_users(data[0])),
+            self._flatten_emb_grads(emb_gradients, _num_users(data[0])),
             segment_ids,
             unique_tokens,
             keep_step,
@@ -1573,7 +1566,7 @@ class RecsysTrainer(Trainer):
     def async_emb_update(
         self,
         state: RecsysTrainingState,
-        data: RecsysFeaturesBatch,
+        data: tuple[RecsysFeaturesBatch, ...],
         lr: float,
     ):
         assert self._batch_pipeline.reserve is not None
@@ -1733,12 +1726,14 @@ class RecsysTrainer(Trainer):
         row_sharding = NamedSharding(self.mesh, P(data_axis, None))
 
         def first_step_embedding_lookup_start(state, data):
-            token_ids = self._step_token_ids(data).astype(jnp.int32)
+            token_ids = _step_token_ids(
+                [self.get_flattened_token_ids(b) for b in data], data_axis
+            ).astype(jnp.int32)
             emb_table, lookup_pin = recsys_async_emb.lookup_start(
                 self._async_emb_context,
                 token_ids,
                 state.emb_table.x,
-                gate=token_ids[:1, :1].astype(jnp.float32),
+                gate=token_ids[0, :1, :1].astype(jnp.float32),
             )
             return (state._replace(emb_table=replace(state.emb_table, x=emb_table)), lookup_pin)
 
@@ -1792,12 +1787,15 @@ class RecsysTrainer(Trainer):
                 f"num_microbatch={self.num_microbatch} must divide "
                 f"bs_per_device={self.bs_per_device}"
             )
-        if self.num_microbatch > 1 and not self.use_async_emb:
-            raise ValueError("num_microbatch > 1 requires use_async_emb=True")
-        if self.num_microbatch > 1 and type(self.model_config) is not RecsysAggregatedModelConfig:
-            raise ValueError("num_microbatch > 1 supports only the ranker")
-        if self.num_microbatch > 1 and self.empty_history_augmentation_rate > 0:
-            raise ValueError("num_microbatch > 1 does not support empty_history_augmentation_rate")
+        if self.num_microbatch > 1:
+            if not self.use_async_emb:
+                raise ValueError("num_microbatch > 1 requires use_async_emb=True")
+            if type(self.model_config) is not RecsysAggregatedModelConfig:
+                raise ValueError("num_microbatch > 1 supports only the ranker")
+            if self.empty_history_augmentation_rate > 0:
+                raise ValueError(
+                    "num_microbatch > 1 does not support empty_history_augmentation_rate"
+                )
 
         self._init_shmem_write_pool()
         self._free_ports()
@@ -1842,26 +1840,33 @@ class RecsysTrainer(Trainer):
             assert isinstance(
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
+            model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
+            smoothing_windows = tuple(self.smoothing_windows) if rce_ema is not None else None
+            if type(model) is RecsysAggregatedModel:
+                loss, (stats, metric_inputs) = model.loss(batch, recsys_embeddings, True)
+                return loss, model.metrics(
+                    metric_inputs, batch, stats, rce_ema, rce_alpha, smoothing_windows, calib_ema
+                )
             metrics_state_kwargs = {}
             if rce_ema is not None:
                 metrics_state_kwargs = {
                     "rce_ema": rce_ema,
                     "rce_alpha": rce_alpha,
-                    "smoothing_windows": tuple(self.smoothing_windows),
+                    "smoothing_windows": smoothing_windows,
                     "calib_ema": calib_ema,
                 }
-            return self.model_config.make(
-                sharding_context=make_legacy_sharding_context(self.mesh),
-            ).loss(None, batch, recsys_embeddings, is_training=True, **metrics_state_kwargs)
+            return model.loss(None, batch, recsys_embeddings, True, **metrics_state_kwargs)
 
         @hk.transform
         def loss_fn_eval(batch: RecsysFeaturesBatch, recsys_embeddings: RecsysEmbeddingsParameter):
             assert isinstance(
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
-            return self.model_config.make(
-                sharding_context=make_legacy_sharding_context(self.mesh),
-            ).loss(None, batch, recsys_embeddings, is_training=False)
+            model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
+            if type(model) is RecsysAggregatedModel:
+                loss, (stats, metric_inputs) = model.loss(batch, recsys_embeddings, False)
+                return loss, model.metrics(metric_inputs, batch, stats)
+            return model.loss(None, batch, recsys_embeddings, is_training=False)
 
         @hk.transform
         def user_forward_fn(
@@ -1883,11 +1888,7 @@ class RecsysTrainer(Trainer):
                 model = self.model_config.make(
                     sharding_context=make_legacy_sharding_context(self.mesh)
                 )
-                return model.microbatch_loss, (
-                    model.loss_normalizers,
-                    model.microbatch_loss,
-                    model.metrics,
-                )
+                return model.loss, (model.loss_inputs_and_normalizers, model.loss, model.metrics)
 
             self.microbatch_loss_fns = hk.multi_transform(microbatch_loss_fns)
 
@@ -1964,12 +1965,8 @@ class RecsysTrainer(Trainer):
         else:
             rng, init_data = self._rng_and_init_data()
             if self.num_microbatch > 1:
-                init_data = jax.tree.map(
-                    lambda x: jax.ShapeDtypeStruct(
-                        (x.shape[0] // self.num_microbatch, *x.shape[1:]), x.dtype
-                    ),
-                    init_data,
-                )
+                assert isinstance(self.dataset, PhoenixDataset)
+                init_data = self.dataset.example_data_shape(self.batch_size // self.num_microbatch)
             init_data = typing.cast(RecsysFeaturesBatch, init_data)
         emb_table_init_data = self.create_embedding_init_data()
 

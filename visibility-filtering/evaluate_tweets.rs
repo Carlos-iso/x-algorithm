@@ -154,12 +154,15 @@ impl EvaluateTweetsEndpoint {
                     Outcome::NotEvaluated(vf_pb::NotEvaluated {})
                 } else {
                     match evaluations.get(&TweetId(tweet.tweet_id)) {
-                        Some(
-                            evaluation @ (Evaluation::Complete { .. } | Evaluation::NotFound(_)),
-                        ) => evaluated_outcome(evaluation.verdict(), safety_level, &policies),
-                        Some(Evaluation::Partial { .. } | Evaluation::Failed(_)) | None => {
-                            Outcome::Failed(vf_pb::Failed {})
+                        Some(evaluation @ Evaluation::Complete { .. }) => {
+                            evaluated_outcome(evaluation.verdict(), safety_level, &policies)
                         }
+                        Some(
+                            Evaluation::NotFound(_)
+                            | Evaluation::Partial { .. }
+                            | Evaluation::Failed(_),
+                        )
+                        | None => Outcome::Failed(vf_pb::Failed {}),
                     }
                 };
                 vf_pb::TweetEvaluation {
@@ -322,13 +325,7 @@ mod tests {
             (
                 vec![5, 7],
                 2,
-                vec![
-                    suspended,
-                    filtered(ThriftFilteredReason::SafetyResult(SafetyResult::new(
-                        None,
-                        Action::Drop(action::Drop::new(None, None)),
-                    ))),
-                ],
+                vec![suspended, Outcome::Failed(vf_pb::Failed {})],
             ),
         ] {
             let calls_before = sources.keys(Source::TesPureCore).len();

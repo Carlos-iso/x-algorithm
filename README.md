@@ -65,7 +65,7 @@ This update is also paired with a new [**Under the Hood**](#under-the-hood-label
 The For You feed is assembled per request. Posts come from two places:
 
 1. **In-Network** — [`thunder/`](thunder/) keeps recent posts from the accounts a viewer follows in memory
-2. **Out-of-Network** — [`phoenix/`](phoenix/) retrieval and [`simclusters/`](simclusters/) find posts from accounts the viewer does not follow
+2. **Out-of-Network** — [`phoenix/`](phoenix/) retrieval and [`simclusters/`](simclusters/) find posts from accounts the viewer does not follow. [`popular_posts_source`](home-mixer/sources/popular_posts_source.rs) adds a shared list of popular recent posts.
 
 Both are ranked together by the same model. **Phoenix** reads the viewer's recent engagement history and predicts, for each post, how likely the viewer is to take each action on it. Those predictions are combined into one score using weights held in the code — see [Scoring and Ranking](#scoring-and-ranking).
 
@@ -105,7 +105,7 @@ Ranking sets the order. Whether a post can be shown at all is decided separately
 │  │    │ IN-NETWORK                    │ │ OUT-OF-NETWORK                         │    │  │
 │  │    │ <a href="thunder/">Thunder</a>                       │ │ <a href="phoenix/">Phoenix retrieval</a>   retrieval model    │    │  │
 │  │    │   recent posts from the       │ │ <a href="simclusters/">SimClusters</a>         cluster similarity │    │  │
-│  │    │   accounts the viewer follows │ │                                        │    │  │
+│  │    │   accounts the viewer follows │ │ <a href="home-mixer/sources/popular_posts_source.rs">Popular posts</a>       shared list        │    │  │
 │  │    └───────────────────────────────┘ └────────────────────────────────────────┘    │  │
 │  └────────────────────────────────────────────────────────────────────────────────────┘  │
 │                                            ▼                                             │
@@ -256,11 +256,12 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
 ### Candidate Sources
 
 
-| Component                        | What it does                                                                                              |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| [`thunder/`](thunder/)           | Holds recent posts in memory as they are published, and returns those from the accounts a viewer follows. |
-| [`phoenix/`](phoenix/) retrieval | Embeds the viewer and each post as vectors, and returns the posts nearest the viewer.                     |
-| [`simclusters/`](simclusters/)   | Clusters accounts and posts by who engages with what, then uses the clusters to find candidates.          |
+| Component                                                               | What it does                                                                                              |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| [`thunder/`](thunder/)                                                  | Holds recent posts in memory as they are published, and returns those from the accounts a viewer follows. |
+| [`phoenix/`](phoenix/) retrieval                                        | Embeds the viewer and each post as vectors, and returns the posts nearest the viewer.                     |
+| [`simclusters/`](simclusters/)                                          | Clusters accounts and posts by who engages with what, then uses the clusters to find candidates.          |
+| [`popular_posts_source.rs`](home-mixer/sources/popular_posts_source.rs) | A shared list of popular recent posts, initially from the most-followed active accounts.                                     |
 
 
 

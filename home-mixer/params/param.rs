@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-05T16:00:50Z
+// mirrored from config feature-switch defaults; last sync 2026-10-06T16:00:58Z
 use xai_feature_switches::param;
 
 param!(
@@ -384,7 +384,7 @@ param!(
     PostUnexploredWeight,
     f64,
     "rust_home_mixer_post_unexplored_weight",
-    0.02
+    0.015
 );
 param!(
     ContDwellTimeWeight,
@@ -944,7 +944,7 @@ param!(
     EnablePopularPostsSource,
     bool,
     "rust_home_mixer_enable_popular_posts_source",
-    false
+    true
 );
 param!(
     PopularPostsMaxResults,

@@ -168,6 +168,9 @@ OPTIONAL_COLUMNS: list[str] = [
     "webConvTrackingIntegrationSeq",
     "exactPhraseSeq",
     "matchedWordFractionSeq",
+    "lexicalTextSeq",
+    "lexicalQuerySeq",
+    "lexicalAuthorSeq",
 ]
 
 

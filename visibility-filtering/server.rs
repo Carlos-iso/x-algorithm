@@ -118,13 +118,12 @@ mod tests {
     use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
     use crate::safety_label_source::SafetyLabelSource;
     use std::collections::HashMap;
-    use xai_visibility_filtering::evaluated::EvaluationResult;
     use xai_visibility_filtering::vf_client::XaiVfClient;
     use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
-    use xai_x_thrift::action::{self, Action};
-    use xai_x_thrift::safety_result::{FilteredReason, SafetyResult};
+    use xai_x_thrift::safety_result::FilteredReason;
     use xai_x_thrift::tweet_service::{
-        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
+        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,
+        TweetFieldsResultState,
     };
 
     struct NoLabels;
@@ -188,7 +187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_tweets_loopback() {
+    async fn evaluate_tweets_loopback_overrides_only_a_tweetypie_found() {
         let (channel, handle) = serve(server(
             InMemorySources::default().tweet(1, 100).authors(&[100]),
         ))
@@ -201,11 +200,26 @@ mod tests {
                 outer_author_id: None,
             }),
         };
+        let found = || TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
+        let protected = || {
+            TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
+                FilteredReason::AuthorIsProtected(true),
+            ))
+        };
+        let deleted =
+            || TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));
+        let cases = [
+            (tweet(1, None), found(), Some(found())),
+            (tweet(1, None), protected(), Some(protected())),
+            (tweet(1, Some(2)), found(), None),
+            (tweet(2, None), found(), None),
+            (tweet(2, None), deleted(), Some(deleted())),
+        ];
         let home = client
             .evaluate_tweets(
                 vf_pb::EvaluateTweetsRequest {
                     safety_level: 8,
-                    tweets: vec![tweet(1, None), tweet(1, Some(2)), tweet(2, None)],
+                    tweets: cases.iter().map(|(tweet, ..)| *tweet).collect(),
                     ..Default::default()
                 },
                 &Default::default(),
@@ -214,20 +228,14 @@ mod tests {
         handle.abort();
         assert!(handle.await.unwrap_err().is_cancelled());
 
-        assert_eq!(
-            home.unwrap(),
-            vec![
-                EvaluationResult::Evaluated(Box::new(TweetFieldsResultState::Found(
-                    TweetFieldsResultFound::new(None)
-                ))),
-                EvaluationResult::NotEvaluated,
-                EvaluationResult::Evaluated(Box::new(TweetFieldsResultState::Filtered(
-                    TweetFieldsResultFiltered::new(FilteredReason::SafetyResult(
-                        SafetyResult::new(None, Action::Drop(action::Drop::new(None, None)),)
-                    ))
-                ))),
-            ]
-        );
+        let served: Vec<_> = home
+            .unwrap()
+            .into_iter()
+            .zip(&cases)
+            .map(|(vf, (_, fetched, _))| vf.into_result_state(fetched.clone()))
+            .collect();
+        let expected: Vec<_> = cases.into_iter().map(|(.., expected)| expected).collect();
+        assert_eq!(served, expected);
     }
 
     #[tokio::test]

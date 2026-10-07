@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from xai_configlib import Config, configclass
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
-from xrex.utils.sharding import maybe_shard_map, with_sharding_constraint
+from xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual
 
 
 @configclass
@@ -126,7 +126,7 @@ class CustomAttention(Attention):
             )
         )
 
-        return maybe_shard_map(
+        return shard_map_unless_manual(
             body_fn,
             mesh=self.sharding_context.mesh,
             in_specs=in_specs,
@@ -260,7 +260,7 @@ class JaxAttention(Attention):
             )
 
         query = jnp.reshape(query, (b, t, kv_h, h // kv_h, d))
-        query = with_sharding_constraint(
+        query = with_sharding_constraint_unless_manual(
             query,
             sharding_rule(
                 NamedShape(
@@ -281,7 +281,7 @@ class JaxAttention(Attention):
             causal_mask = jnp.tril(jnp.ones((1, 1, t, t))).astype(query.dtype)
             mask = mask * causal_mask
         if segment_ids is not None:
-            segment_ids = with_sharding_constraint(
+            segment_ids = with_sharding_constraint_unless_manual(
                 segment_ids,
                 sharding_rule(
                     NamedShape(segment_ids.shape, ("batch_attn", "replicated")),
@@ -289,7 +289,7 @@ class JaxAttention(Attention):
             )
             segment_ids_for_keys = segment_ids_k if segment_ids_k is not None else segment_ids
             if segment_ids_k is not None:
-                segment_ids_for_keys = with_sharding_constraint(
+                segment_ids_for_keys = with_sharding_constraint_unless_manual(
                     segment_ids_for_keys,
                     sharding_rule(
                         NamedShape(segment_ids_for_keys.shape, ("batch_attn", "replicated")),
@@ -313,7 +313,7 @@ class JaxAttention(Attention):
         attn_weights = jax.nn.softmax(attn_logits).astype(query.dtype)
 
         attn = jnp.einsum("...hHtT,...Thd->...thHd", attn_weights, value)
-        attn = with_sharding_constraint(
+        attn = with_sharding_constraint_unless_manual(
             attn,
             sharding_rule(
                 NamedShape(

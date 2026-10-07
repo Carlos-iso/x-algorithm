@@ -1004,6 +1004,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
     max_candidates_for_embeddings: int = 64
 
     compute_post_unexplored_label: bool = False
+    search_negative_clear_word_match: bool = False
 
     exclude_required_columns: str = ""
 
@@ -1079,6 +1080,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
+            search_negative_clear_word_match=self.search_negative_clear_word_match,
             ads_head_masking=self.ads_head_masking,
         )
 

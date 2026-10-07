@@ -44,6 +44,7 @@ from xrex.data.recsys.feature_config import (
     UserFloatFeature,
     UserInt64Feature,
 )
+from xrex.data.recsys.negative_word_match import clear_word_match, compute_word_match
 from xrex.models.recsys_embedding import HashKeys, HashTable
 
 if TYPE_CHECKING:
@@ -351,6 +352,10 @@ class RecsysFeaturesBatch(TypedDict):
     packing_layout: NotRequired[SequencePackedLayout | None]
 
 
+LEXICAL_TEXT_COLUMN = "lexicalTextSeq"
+LEXICAL_QUERY_COLUMN = "lexicalQuerySeq"
+LEXICAL_AUTHOR_COLUMN = "lexicalAuthorSeq"
+
 VALUE_LABEL_DTYPES = {
     "value_label_valid": np.bool_,
     "value_baseline_mean_usd": np.float32,
@@ -414,6 +419,25 @@ def _extend_conversion_delays(post_seq: PostSeq, shape: tuple[int, int]) -> np.n
     return out
 
 
+def _scatter_candidate_slots(slots: np.ndarray, candidate_mask: np.ndarray) -> np.ndarray:
+    rank = np.cumsum(candidate_mask, axis=1) - 1
+    keep = candidate_mask & (rank < slots.shape[1])
+    gathered = np.take_along_axis(slots, np.clip(rank, 0, slots.shape[1] - 1), axis=1)
+    return np.where(keep, gathered, np.zeros((), dtype=slots.dtype))
+
+
+def _read_string_slots(
+    record_batch: pa.RecordBatch, column: str, candidate_mask: np.ndarray
+) -> np.ndarray | None:
+    if column not in record_batch.schema.names:
+        return None
+    col = record_batch.column(column)
+    width = col.type.list_size
+    values = col.values.slice(col.offset * width, candidate_mask.shape[0] * width)
+    slots = np.asarray(values.to_numpy(zero_copy_only=False), dtype=object)
+    return _scatter_candidate_slots(slots.reshape(candidate_mask.shape[0], width), candidate_mask)
+
+
 def _extend_value_labels(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
     labels = {key: np.zeros(shape, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()}
     for key in labels:
@@ -472,6 +496,7 @@ def from_record_batch(
     sid_num_levels: int = 0,
     compute_post_unexplored_label: bool = False,
     zero_stale_post_14d_candidate_counts: bool = False,
+    search_negative_clear_word_match: bool = False,
     ads_head_masking: bool = False,
 ) -> RecsysFeaturesBatch:
     start = time.time()
@@ -519,6 +544,12 @@ def from_record_batch(
 
     value_labels = _read_value_labels(record_batch, (batch_size, actions.shape[1]))
     conversion_delays = _read_conversion_delays(record_batch, (batch_size, actions.shape[1]))
+    lexical_strings = {
+        column: slots
+        for column in (LEXICAL_TEXT_COLUMN, LEXICAL_QUERY_COLUMN, LEXICAL_AUTHOR_COLUMN)
+        if (slots := _read_string_slots(record_batch, column, new_event_mask & padding_mask))
+        is not None
+    }
 
     if "clientAppIdSeq" in record_batch.schema.names:
         client_app_id = _col(record_batch, "clientAppIdSeq", batch_size, np.int32)
@@ -723,6 +754,9 @@ def from_record_batch(
     candidate_conversion_delays = np.full(
         (*cand_shape_2d, len(CONVERSION_DELAY_COLUMNS)), CONVERSION_DELAY_NONE, dtype=np.int32
     )
+    candidate_lexical_strings = {
+        column: np.zeros(cand_shape_2d, dtype=object) for column in lexical_strings
+    }
     candidate_post_creation_ts_sec = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_actions = np.zeros(cand_shape_3d, dtype=actions.dtype)
     candidate_continuous_actions = np.zeros(
@@ -890,6 +924,8 @@ def from_record_batch(
             for key, values in value_labels.items():
                 candidate_value_labels[key][*cslice] = values[*dslice]
             candidate_conversion_delays[*cslice] = conversion_delays[*dslice, :]
+            for column, values in lexical_strings.items():
+                candidate_lexical_strings[column][*cslice] = values[*dslice]
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
@@ -1100,6 +1136,10 @@ def from_record_batch(
         max_candidate_post_action_pairs,
         sample_source=sample_source,
         ads_head_masking=ads_head_masking,
+        clear_negative_word_match=search_negative_clear_word_match,
+        lexical_text=candidate_lexical_strings.get(LEXICAL_TEXT_COLUMN),
+        lexical_query=candidate_lexical_strings.get(LEXICAL_QUERY_COLUMN),
+        lexical_author=candidate_lexical_strings.get(LEXICAL_AUTHOR_COLUMN),
     )
 
     candidate_seq_with_negatives = apply_global_negative_sampling(
@@ -1159,6 +1199,10 @@ def apply_negative_sampling(
     *,
     sample_source: npt.NDArray[np.integer] | None = None,
     ads_head_masking: bool = False,
+    clear_negative_word_match: bool = False,
+    lexical_text: np.ndarray | None = None,
+    lexical_query: np.ndarray | None = None,
+    lexical_author: np.ndarray | None = None,
 ) -> PostSeq:
     if num_negatives_per_example == 0:
         return post_seq
@@ -1333,6 +1377,18 @@ def apply_negative_sampling(
     else:
         query_dissimilar = None
 
+    lexical = (
+        (lexical_text, lexical_query, lexical_author)
+        if clear_negative_word_match
+        and lexical_text is not None
+        and lexical_query is not None
+        and lexical_author is not None
+        else None
+    )
+    new_lexical_text = np.zeros((batch_size, total_candidate_slots), dtype=object)
+    new_lexical_query = np.zeros((batch_size, total_candidate_slots), dtype=object)
+    new_lexical_author = np.zeros((batch_size, total_candidate_slots), dtype=object)
+
     def _copy_neg_features(curr_user_idx, start_slot, end_slot, post_src, query_src):
         new_post_hashes[curr_user_idx, start_slot:end_slot, :] = post_hashes[post_src]
         new_auth_hashes[curr_user_idx, start_slot:end_slot, :] = auth_hashes[post_src]
@@ -1374,6 +1430,10 @@ def apply_negative_sampling(
             new_int64_features[curr_user_idx, start_slot:end_slot, :] = int64_features[post_src]
         if new_post_sids is not None and _post_sids is not None:
             new_post_sids[curr_user_idx, start_slot:end_slot, :] = _post_sids[post_src]
+        if lexical is not None:
+            new_lexical_text[curr_user_idx, start_slot:end_slot] = lexical[0][post_src]
+            new_lexical_query[curr_user_idx, start_slot:end_slot] = lexical[1][query_src, 0:1]
+            new_lexical_author[curr_user_idx, start_slot:end_slot] = lexical[2][post_src]
 
     for i in range(num_negatives_per_example):
         neg_user_idx = neg_user_indices[:, i]
@@ -1412,6 +1472,20 @@ def apply_negative_sampling(
             _copy_neg_features(
                 curr_user_idx, start_slot, end_slot, post_src=curr_user_idx, query_src=neg_user_idx
             )
+
+    negative_slots = new_post_hashes[:, :, 0] != 0
+    negative_slots[:, :max_candidate_post_action_pairs] = False
+    if has_search_query and clear_negative_word_match:
+        clear_word_match(new_categorical_features, new_float_features, negative_slots)
+    if has_search_query and lexical is not None:
+        compute_word_match(
+            new_categorical_features,
+            new_float_features,
+            negative_slots,
+            new_lexical_text,
+            new_lexical_query,
+            new_lexical_author,
+        )
 
     negative_slice = slice(max_candidate_post_action_pairs, total_candidate_slots)
     new_trained_mask[:, negative_slice] = build_trained_candidate_mask(

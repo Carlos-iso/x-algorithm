@@ -136,6 +136,7 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         enable_stale_post=mparams.get("enable_stale_post", False),
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
+        search_negative_clear_word_match=mparams.get("search_negative_clear_word_match", False),
     )
 
 

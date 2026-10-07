@@ -8,7 +8,7 @@ import optax
 from jax.sharding import PartitionSpec as P
 
 from xrex.data.recsys.ads_head_masking import EARLY_RELABEL_STREAM_ID
-from xrex.utils.sharding import with_sharding_constraint
+from xrex.utils.sharding import with_sharding_constraint_unless_manual
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
@@ -30,7 +30,7 @@ def multihot_loss_compute(
 ):
     logits = logits.astype(jnp.float32)
 
-    one_hot_targets = with_sharding_constraint(raw_targets, one_hot_targets_sharding)
+    one_hot_targets = with_sharding_constraint_unless_manual(raw_targets, one_hot_targets_sharding)
 
     assert logits.shape == one_hot_targets.shape
 
@@ -156,7 +156,7 @@ def purchase_value_loss_compute(
     delta: float = 1.0,
     raw_weights: jax.Array | None = None,
     normalizer: jax.Array | None = None,
-) -> tuple[jax.Array, dict[str, jax.Array]]:
+) -> tuple[jax.Array, jax.Array]:
     if not 0 < delta < float("inf"):
         raise ValueError("purchase value Huber delta must be finite and positive")
     ratio = raw_ratio.astype(jnp.float32)
@@ -186,7 +186,7 @@ def purchase_value_loss_compute(
             jnp.sum(jnp.where(valid, pred, 0.0) * weights),
         ]
     )
-    return loss, {**purchase_value_stats(sums), "_purchase-value-sums": sums}
+    return loss, sums
 
 
 def purchase_value_stats(sums: jax.Array) -> dict[str, jax.Array]:

@@ -191,7 +191,6 @@ ffi::Error LookupStart(
         table.dimensions()[0]
     };
     ctx->armLookup(job, stream);
-    ctx->flushLookupTail(true);
     return ffi::Error::Success();
   });
 }
@@ -252,6 +251,7 @@ ffi::Error StageUpdate(
         static_cast<const int32_t*>(pending.untyped_data()),
         stream
     );
+    ctx->flushLookupTail(true);
     return ffi::Error::Success();
   });
 }
@@ -507,6 +507,7 @@ ffi::Error RowwiseAdagradUpdateDone(
       return invalid("rowwise_adagrad_update_done: context not initialized");
     }
     ctx->finishUpdate(stream);
+    ctx->flushLookupTail(true);
     const int8_t* scalars = ctx->arena() + ctx->layout().scalars;
     auto copy = [&](ffi::Result<ffi::AnyBuffer>& out, size_t offset) {
       XAI_CUDA_CHECK(cudaMemcpyAsync(

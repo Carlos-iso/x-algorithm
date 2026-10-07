@@ -533,40 +533,58 @@ def load_checkpoint_streamed(
     replaced: list[tuple[jax.Array, jax.Array]] = []
     futures: dict[Any, tuple[str, str, int]] = {}
 
-    tspec_transform = None if kvstore_base is None else _encrypted_tspec_transform(kvstore_base)
-    stores = _open_tensors(
-        plan, path, use_zarr3, ts_context, device_state, domains, tspec_transform
-    )
+    node_lock: _NodeBatchLock | None = None
+    if _restore_node_serialize_enabled():
+        node_lock = _NodeBatchLock(_node_lock_path())
+        rank_logger.info(
+            "restore node-serialize ACTIVE (flock per batch, streamed) lock=%s pid=%d "
+            "num_batches=%d",
+            node_lock._path,
+            os.getpid(),
+            num_batches,
+        )
 
-    for batch in batches:
-        staging = _stage_to_host({name: device_state[name] for _, name, _, _ in batch})
+    with contextlib.ExitStack() as stack:
+        if node_lock is not None:
+            stack.callback(node_lock.close)
+        tspec_transform = None if kvstore_base is None else _encrypted_tspec_transform(kvstore_base)
+        stores = _open_tensors(
+            plan, path, use_zarr3, ts_context, device_state, domains, tspec_transform
+        )
 
-        for checkpoint_name, name, mask, _nbytes in batch:
-            t = stores[checkpoint_name]
-            for s, future in enumerate(
-                _read_into_shards(t, staging[name], mask, domains.get(name))
-            ):
-                futures[future] = (checkpoint_name, name, s)
+        for batch in batches:
+            with node_lock if node_lock is not None else contextlib.nullcontext():
+                staging = _stage_to_host({name: device_state[name] for _, name, _, _ in batch})
 
-        _drain_read_futures(futures, staging, path, timeout)
+                for checkpoint_name, name, mask, _nbytes in batch:
+                    t = stores[checkpoint_name]
+                    for s, future in enumerate(
+                        _read_into_shards(t, staging[name], mask, domains.get(name))
+                    ):
+                        futures[future] = (checkpoint_name, name, s)
 
-        new_arrays = {
-            name: jax.device_put(staging[name], device_state[name].sharding)
-            for _, name, _, _ in batch
-        }
-        jax.block_until_ready(list(new_arrays.values()))
-        batch_replaced = []
-        for _, name, _, _ in batch:
-            batch_replaced.append((device_state[name], new_arrays[name]))
-            device_state[name] = new_arrays[name]
-        if on_replaced is not None:
-            on_replaced(batch_replaced)
-        else:
-            replaced.extend(batch_replaced)
+                _drain_read_futures(futures, staging, path, timeout)
 
-        del staging, new_arrays, batch_replaced
+                new_arrays = {
+                    name: jax.device_put(staging[name], device_state[name].sharding)
+                    for _, name, _, _ in batch
+                }
+                jax.block_until_ready(list(new_arrays.values()))
+                batch_replaced = []
+                for _, name, _, _ in batch:
+                    batch_replaced.append((device_state[name], new_arrays[name]))
+                    device_state[name] = new_arrays[name]
+                if on_replaced is not None:
+                    on_replaced(batch_replaced)
+                else:
+                    replaced.extend(batch_replaced)
 
-    _release_batch_memory()
+                del staging, new_arrays, batch_replaced
+            if node_lock is not None:
+                _release_batch_memory()
+
+    if node_lock is None:
+        _release_batch_memory()
     rank_logger.info("Loading checkpoint (streamed) took %.2f sec", time.time() - start)
     return replaced
 

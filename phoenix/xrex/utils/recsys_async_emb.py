@@ -31,15 +31,6 @@ def table_spec(context_handle: ContextHandle) -> P:
     return P(None, context_handle.table_axis)
 
 
-def _data_shards(context_handle: ContextHandle) -> int:
-    return math.prod(context_handle.mesh.shape[axis] for axis in context_handle.data_axis)
-
-
-def _rows_spec(context_handle: ContextHandle, ndim: int, rows_axis: int) -> P:
-    rows_axis = max(ndim + rows_axis, 0)
-    return P(*(context_handle.data_axis if i == rows_axis else None for i in range(ndim)))
-
-
 def kernel_bindings(context_handle: ContextHandle):
     if is_row_sharded(context_handle):
         from xrex.cuda.row_emb import row_emb
@@ -68,7 +59,7 @@ def lookup_start(
 
     @shard_map(
         mesh=context_handle.mesh,
-        in_specs=(_rows_spec(context_handle, token_ids.ndim, -2), spec, P()),
+        in_specs=(P(None, context_handle.data_axis, None), spec, P()),
         out_specs=(spec, P(context_handle.data_axis, None)),
         check_vma=False,
     )
@@ -85,19 +76,19 @@ def lookup_start(
 def lookup_done(
     context_handle: ContextHandle,
     lookup_pin: jax.Array,
-    token_ids_shape: tuple[int, ...] | None = None,
+    token_ids_shape: tuple[int, int, int],
 ) -> jax.Array:
     bindings = kernel_bindings(context_handle)
-    local_shape = (-1, context_handle.emb_width)
-    if token_ids_shape is not None:
-        *leading, users, tokens = token_ids_shape
-        users //= _data_shards(context_handle)
-        local_shape = (*leading, users, tokens, context_handle.emb_width)
+    microbatches, users, tokens = token_ids_shape
+    data_shards = math.prod(context_handle.mesh.shape[axis] for axis in context_handle.data_axis)
+    assert users % data_shards == 0, (users, data_shards)
+    users //= data_shards
+    local_shape = (microbatches, users, tokens, context_handle.emb_width)
 
     @shard_map(
         mesh=context_handle.mesh,
         in_specs=(P(context_handle.data_axis, None),),
-        out_specs=_rows_spec(context_handle, len(local_shape), -3),
+        out_specs=P(None, context_handle.data_axis, None, None),
         check_vma=False,
     )
     def done(lookup_pin: jax.Array) -> jax.Array:
@@ -106,31 +97,28 @@ def lookup_done(
     return done(lookup_pin)
 
 
-def depend(context_handle: ContextHandle, x: jax.Array, pin: jax.Array) -> jax.Array:
+def depend(
+    context_handle: ContextHandle,
+    x,
+    on: jax.Array,
+    *,
+    x_sharded: bool = True,
+    on_sharded: bool = True,
+):
+    rows = P(context_handle.data_axis)
+
     @shard_map(
         mesh=context_handle.mesh,
-        in_specs=(P(context_handle.data_axis), P()),
-        out_specs=P(context_handle.data_axis),
+        in_specs=(rows if x_sharded else P(), rows if on_sharded else P()),
+        out_specs=rows if x_sharded else P(),
         check_vma=False,
     )
-    def add_pin(x: jax.Array, pin: jax.Array) -> jax.Array:
-        return x.at[(0,) * x.ndim].add(pin.astype(x.dtype)[0])
+    def add_zero(x, on: jax.Array):
+        first = on.reshape(-1)[0].astype(jnp.float32)
+        zero = jnp.where(jnp.isfinite(first), first, 0.0) * 0.0
+        return jax.tree.map(lambda leaf: leaf.at[(0,) * leaf.ndim].add(zero.astype(leaf.dtype)), x)
 
-    return add_pin(x, pin)
-
-
-def zero_pin(context_handle: ContextHandle, x: jax.Array) -> jax.Array:
-    @shard_map(
-        mesh=context_handle.mesh,
-        in_specs=P(context_handle.data_axis),
-        out_specs=P(),
-        check_vma=False,
-    )
-    def pin(x: jax.Array) -> jax.Array:
-        first = x.reshape(-1)[:1].astype(jnp.float32)
-        return jnp.where(jnp.isfinite(first), first, 0.0) * 0.0
-
-    return pin(x)
+    return add_zero(x, on)
 
 
 def stage_update(
@@ -147,7 +135,7 @@ def stage_update(
 
         @shard_map(
             mesh=context_handle.mesh,
-            in_specs=(_rows_spec(context_handle, grads.ndim, -3), P(), P()),
+            in_specs=(P(None, context_handle.data_axis, None, None), P(), P()),
             out_specs=P(context_handle.data_axis, None),
             check_vma=False,
         )
@@ -161,8 +149,8 @@ def stage_update(
     @shard_map(
         mesh=context_handle.mesh,
         in_specs=(
-            _rows_spec(context_handle, grads.ndim, -3),
-            _rows_spec(context_handle, segment_ids.ndim, -2),
+            P(None, context_handle.data_axis, None, None),
+            P(None, context_handle.data_axis, None),
             P(),
             P(),
             P(),
